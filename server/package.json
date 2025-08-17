@@ -1,5 +1,6 @@
 {
 	"dependencies": {
-		"hyperdht": "latest"
+		"hyperdht": "latest",
+		"bip39": "latest"
 	}
 }

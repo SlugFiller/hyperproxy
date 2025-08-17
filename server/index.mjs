@@ -1,6 +1,10 @@
 import DHT from 'hyperdht';
 import {
-	DatabaseSync
+	entropyToMnemonic,
+	mnemonicToEntropy,
+} from 'bip39';
+import {
+	DatabaseSync,
 } from 'node:sqlite';
 import {
 	fileURLToPath,
@@ -31,4 +35,6 @@ else {
 	};
 }
 
-console.log(keyPair);
+const server = node.createServer();
+
+console.log(entropyToMnemonic(keyPair.publicKey));
