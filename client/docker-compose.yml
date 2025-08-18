@@ -1,0 +1,7 @@
+services:
+  scaffold:
+    build:
+      target: scaffold
+  package-lock:
+    build:
+      target: package-lock

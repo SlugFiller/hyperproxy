@@ -9,6 +9,9 @@ import {
 import {
 	fileURLToPath,
 } from 'node:url';
+import {
+	pipeline,
+} from 'node:stream/promises';
 
 const db = new DatabaseSync(fileURLToPath(new URL('config.sqlite', import.meta.url)));
 
@@ -36,5 +39,17 @@ else {
 }
 
 const server = node.createServer();
+
+await server.listen(keyPair)
+
+server.on('connection', function (socket) {
+	console.log('Connection from socket', entropyToMnemonic(socket.remotePublicKey));
+	pipeline(
+		socket,
+		async function* (source, { signal }) {
+		},
+		socket
+	);
+});
 
 console.log(entropyToMnemonic(keyPair.publicKey));
