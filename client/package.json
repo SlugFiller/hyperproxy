@@ -1,6 +1,8 @@
 {
 	"scripts": {
-		"scaffold": "docker-compose build scaffold --progress=plain && docker-compose up scaffold && docker-compose cp scaffold:/usr/src/app ./app && docker-compose down scaffold",
-		"package-lock": "docker-compose build package-lock --progress=plain && docker-compose up package-lock && docker-compose cp package-lock:/usr/src/app/package-lock.json ./app && docker-compose down package-lock"
+		"scaffold": "(docker-compose --progress=plain up --build scaffold && docker-compose cp scaffold:/usr/src/app ./app || cd .) && docker-compose down scaffold",
+		"package-lock": "(docker-compose --progress=plain up --build package-lock && docker-compose cp package-lock:/usr/src/app/package-lock.json ./app || cd .) && docker-compose down package-lock",
+		"deploy-debug": "(docker-compose --progress=plain up --build deploy-debug && node -e \"import { mkdir } from 'node:fs/promises'; await mkdir('./app/android/app/build/outputs/apk/debug', { recursive: true })\" && docker-compose cp deploy-debug:/usr/src/app/android/app/build/outputs/apk/debug ./app/android/app/build/outputs/apk && (adb uninstall com.slugfiller.hyperproxy || cd .) && adb install ./app/android/app/build/outputs/apk/debug/app-debug.apk || cd .) && docker-compose down deploy-debug",
+		"debug": "node -e \"import { spawn } from 'node:child_process';const env = {...process.env, 'METRO_PORT': process.argv[1] || '8081' };async function exec(command, ...args) {const child = spawn(command, args, { stdio: 'inherit', env }); function sigint() { child.kill('SIGINT'); }; try { process.on('SIGINT', sigint); return await new Promise((resolve) => { child.on('exit', (code) => resolve(code === 0)); }); } finally { process.off('SIGINT', sigint); }  } await exec('adb', 'reverse', 'tcp:8081', 'tcp:' + (process.argv[1] || '8081')) && await exec('docker-compose', '--progress=plain', 'up', '--build', '--watch', 'debug'); await exec('docker-compose', 'down', 'debug'); await exec('adb', 'reverse', '--remove', 'tcp:8081');\" --"
 	}
 }

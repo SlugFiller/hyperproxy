@@ -1,3 +1,4 @@
 Dockerfile
 docker-compose.yml
-app/node_modules/**
+package.json
+app/android/app/build/**

@@ -5,3 +5,15 @@ services:
   package-lock:
     build:
       target: package-lock
+  deploy-debug:
+    build:
+      target: metro-build
+  debug:
+    build:
+      target: metro
+    develop:
+      watch:
+        - action: rebuild
+          path: ./app
+    ports:
+      - ${METRO_PORT:-8081}:8081
