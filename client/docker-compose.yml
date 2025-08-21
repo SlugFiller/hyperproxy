@@ -17,3 +17,9 @@ services:
           path: ./app
     ports:
       - ${METRO_PORT:-8081}:8081
+  generate-keystore:
+    build:
+      target: keygen
+  release:
+    build:
+      target: release

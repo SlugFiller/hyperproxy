@@ -48,3 +48,27 @@ COPY ./app /usr/src/app/
 RUN npm run lint
 
 CMD ["npm", "run", "start"]
+
+FROM package-lock AS keygen
+
+WORKDIR /usr/src/app/android/app
+
+RUN keytool -genkeypair -v -storetype PKCS12 -keystore release.keystore -storepass android -alias androidreleasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Unknown, OU=Unknown, O=Unknown, L=Unknown, ST=Unknown, C=Unknown"
+
+FROM package-lock AS release
+
+WORKDIR /usr/src/app/android
+
+COPY ./app/android/gradle /usr/src/app/android/gradle/
+COPY ./app/android/build.gradle ./app/android/gradle.properties ./app/android/gradlew ./app/android/settings.gradle /usr/src/app/android
+COPY ./app/android/app/build.gradle ./app/android/app/release.keystore ./app/android/app/proguard-rules.pro /usr/src/app/android/app/
+
+RUN ./gradlew --build-cache --no-daemon
+
+COPY ./app/android/app/src/main/AndroidManifest.xml /usr/src/app/android/app/src/main/AndroidManifest.xml
+
+RUN ./gradlew --build-cache --no-daemon :app:mergeReleaseNativeLibs
+
+COPY ./app /usr/src/app/
+
+RUN ./gradlew --build-cache --no-daemon assembleRelease
