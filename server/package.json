@@ -1,6 +1,6 @@
 {
 	"dependencies": {
 		"hyperdht": "latest",
-		"bip39": "latest"
+		"@scure/bip39": "latest"
 	}
 }

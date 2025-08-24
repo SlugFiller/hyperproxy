@@ -2,7 +2,10 @@ import DHT from 'hyperdht';
 import {
 	entropyToMnemonic,
 	mnemonicToEntropy,
-} from 'bip39';
+} from '@scure/bip39';
+import {
+	wordlist
+} from '@scure/bip39/wordlists/english';
 import {
 	DatabaseSync,
 } from 'node:sqlite';
@@ -40,10 +43,8 @@ else {
 
 const server = node.createServer();
 
-await server.listen(keyPair)
-
 server.on('connection', function (socket) {
-	console.log('Connection from socket', entropyToMnemonic(socket.remotePublicKey));
+	console.log('Connection from socket', entropyToMnemonic(socket.remotePublicKey, wordlist));
 	pipeline(
 		socket,
 		async function* (source, { signal }) {
@@ -52,4 +53,20 @@ server.on('connection', function (socket) {
 	);
 });
 
-console.log(entropyToMnemonic(keyPair.publicKey));
+await server.listen(keyPair)
+
+function* chunk(iter, len) {
+	let out = [];
+	for (const item of iter) {
+		out.push(item);
+		if (out.length >= len) {
+			yield out;
+			out = [];
+		}
+	}
+	if (out.length) {
+		yield out;
+	}
+}
+
+console.log([...chunk(entropyToMnemonic(keyPair.publicKey, wordlist).split(' ').map(x => x.padEnd(8)), 4).map(x => x.join(' '))].join('\n'));
