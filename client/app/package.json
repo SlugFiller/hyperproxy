@@ -10,12 +10,14 @@
     "test": "jest"
   },
   "dependencies": {
+    "@scure/bip39": "latest",
+    "hyperdht": "latest",
     "react": "19.1.0",
     "react-native": "0.81.0",
+    "react-native-keyboard-controller": "latest",
     "react-native-safe-area-context": "^5.5.2",
-    "react-native-autocomplete-input": "latest",
-    "hyperdht": "latest",
-    "@scure/bip39": "latest"
+    "react-native-reanimated": "latest",
+    "react-native-worklets": "latest"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
