@@ -1,0 +1,6 @@
+{
+	"dependencies": {
+		"bare-rpc": "latest",
+		"hyperdht": "latest"
+	}
+}

@@ -27,6 +27,12 @@ COPY ./app/package.json ./app/package-lock.jso[n] /usr/src/app/
 
 RUN npm install
 
+WORKDIR /usr/src/app/backend/
+
+COPY ./app/backend/package.json ./app/backend/package-lock.jso[n] /usr/src/app/backend/
+
+RUN npm install
+
 CMD ["echo", "Done"]
 
 FROM package-lock AS metro-build
@@ -44,6 +50,8 @@ FROM package-lock AS metro
 WORKDIR /usr/src/app
 
 COPY ./app /usr/src/app/
+
+RUN npx bare-pack --target android --linked --out ./backend.bundle.mjs backend/backend.mjs
 
 RUN npm run lint
 
@@ -70,5 +78,11 @@ COPY ./app/android/app/src/main/AndroidManifest.xml /usr/src/app/android/app/src
 RUN ./gradlew --build-cache --no-daemon :app:mergeReleaseNativeLibs
 
 COPY ./app /usr/src/app/
+
+WORKDIR /usr/src/app
+
+RUN npx bare-pack --target android --linked --out ./backend.bundle.mjs backend/backend.mjs
+
+WORKDIR /usr/src/app/android
 
 RUN ./gradlew --build-cache --no-daemon assembleRelease

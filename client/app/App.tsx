@@ -6,8 +6,13 @@
  */
 
 import {
-	wordlist
+	entropyToMnemonic,
+} from '@scure/bip39';
+import {
+	wordlist,
 } from '@scure/bip39/wordlists/english';
+import b4a from 'b4a';
+import RPC from 'bare-rpc';
 import {
 	Children,
 	useCallback,
@@ -35,6 +40,9 @@ import type {
 	ViewStyle,
 } from 'react-native';
 import {
+	Worklet,
+} from 'react-native-bare-kit';
+import {
 	KeyboardAvoidingView,
 	KeyboardProvider,
 } from 'react-native-keyboard-controller';
@@ -42,6 +50,10 @@ import {
 	SafeAreaProvider,
 	SafeAreaView,
 } from 'react-native-safe-area-context';
+import backendBundle from './backend.bundle.mjs'
+import {
+	RPC_KEYGEN,
+} from './backend/rpc-commands.mjs';
 
 const App: FC = () => {
 	const isDarkMode = useColorScheme() === 'dark';
@@ -56,20 +68,145 @@ const App: FC = () => {
 	);
 };
 
+interface KeyPair {
+	publicKey: Uint8Array;
+	secretKey: Uint8Array;
+}
+
+type KeyPairStatus = 
+	| {
+		status: 'loading',
+	}
+	| {
+		status: 'valid',
+		value: KeyPair,
+	}
+	| {
+		status: 'error',
+		error: KeyPair,
+	}
+;
+
 const AppContent: FC = () => {
 	const [phrase, setPhrase] = useState<string>(' '.repeat(23));
+	const [keyPair, setKeyPair] = useState<KeyPairStatus>({ status: 'loading' });
+	const [showKey, setShowKey] = useState<boolean>(false);
+
+	const worklet = useMemo(() => {
+		return new Worklet();
+	}, []);
+
+	useEffect(() => {
+		worklet.start('/backend.bundle', backendBundle);
+
+		return () => {
+			worklet.IPC.destroy();
+		};
+	}, [worklet]);
+
+	const rpc = useMemo(() => {
+		return new RPC(worklet.IPC);
+	}, [worklet]);
+
+	useEffect(() => {
+		const req = rpc.request(RPC_KEYGEN);
+		req.send(b4a.alloc(0));
+		req.reply().then((keyBundle: Uint8Array) => {
+			const pubKeyLen = b4a.readUInt32LE(keyBundle);
+			setKeyPair({
+				status: 'valid',
+				value: {
+					publicKey: keyBundle.subarray(4, 4 + pubKeyLen),
+					secretKey: keyBundle.subarray(4 + pubKeyLen, keyBundle.byteLength),
+				},
+			});
+		}, (error: Error) => {
+			setKeyPair({
+				status: 'error',
+				error,
+			});
+		});
+	}, [rpc]);
 
 	return (
 		<SafeAreaView style={styles.container}>
 			<KeyboardAvoidingView behavior={"height"} style={styles.container}>
-				<Bip39Phrase
-					value={phrase}
-					setValue={setPhrase}
-					numColumns={4}
-					cellStyle={styles.bipCell}
-				/>
+				{showKey ? (<>
+					{(() => { switch (keyPair.status) {
+						case 'loading': return (
+							<Text>Generating keypair...</Text>
+						);
+						case 'error': return (
+							<View>
+								<Text>Error</Text>
+								<Text>{keyPair.error.message}</Text>
+								<Text>{keyPair.error.stack}</Text>
+							</View>
+						);
+						case 'valid': return (
+							<Bip39Display
+								value={entropyToMnemonic(keyPair.value.publicKey, wordlist)}
+								numColumns={4}
+								style={styles.bipPhrase}
+								cellStyle={styles.bipCell}
+								textStyle={styles.bipText}
+							/>
+						);
+					} })()}
+				</>) : (
+					<Bip39Phrase
+						value={phrase}
+						setValue={setPhrase}
+						numColumns={4}
+						style={styles.bipPhrase}
+						cellStyle={styles.bipCell}
+					/>
+				)}
+				<View style={styles.buttonDrawer}>
+					{showKey ? (
+						<TextButton
+							title="Back"
+							onPress={() => setShowKey(false)}
+							style={styles.button}
+							stylePressed={styles.buttonPressed}
+							styleText={styles.buttonText}
+							stylePressedText={styles.buttonPressedText}
+						/>
+					) : (
+						<TextButton
+							title="Show my key"
+							onPress={() => setShowKey(true)}
+							style={styles.button}
+							stylePressed={styles.buttonPressed}
+							styleText={styles.buttonText}
+							stylePressedText={styles.buttonPressedText}
+						/>
+					)}
+				</View>
 			</KeyboardAvoidingView>
 		</SafeAreaView>
+	);
+};
+
+interface TextButtonProps {
+	title: string;
+	onPress: () => void;
+	style: StyleProp<ViewStyle>;
+	styleText: StyleProp<ViewStyle>;
+	stylePressed: StyleProp<ViewStyle>;
+	stylePressedText: StyleProp<ViewStyle>;
+}
+
+const TextButton: FC<TextButtonProps> = ({ title, onPress, style, styleText, stylePressed, stylePressedText}) => {
+	return (
+		<Pressable
+			onPress={onPress}
+			style={({ pressed }) => pressed ? [style, stylePressed] : [style]}
+		>
+			{({ pressed }) => (
+				<Text style={pressed ? [styleText, stylePressedText] : [styleText]}>{title}</Text>
+			)}
+		</Pressable>
 	);
 };
 
@@ -128,7 +265,7 @@ const Bip39Word: FC<Bip39WordProps> = ({ value, setValue, boundary, ...props }) 
 			if (!active) {
 				return;
 			}
-			const spaceBelow = boundary.y + boundary.height > y + pageY ? boundary.y + boundary.height - y - pageY : 0;
+			const spaceBelow = boundary.y + boundary.height > pageY + height ? boundary.y + boundary.height - pageY - height : 0;
 			const spaceAbove = pageY > boundary.y ? pageY - boundary.y : 0;
 			if (spaceBelow > spaceAbove) {
 				setFloatStyle({
@@ -186,6 +323,23 @@ const Bip39Word: FC<Bip39WordProps> = ({ value, setValue, boundary, ...props }) 
 	);
 }
 
+interface Bip39DisplayProps {
+	value: string;
+	textStyle?: StyleProp<ViewStyle>;
+}
+
+const Bip39Display: FC<Bip39DisplayProps> = ({ value, textStyle, ...props }) => {
+	const words = value.split(' ');
+
+	return (
+		<Grid {...props}>
+			{words.map((word) => (
+				<Text style={textStyle}>{word}</Text>
+			))}
+		</Grid>
+	);
+};
+
 interface GridProps {
 	rowStyle?: StyleProp<ViewStyle>;
 	cellStyle?: StyleProp<ViewStyle>;
@@ -236,14 +390,44 @@ const styles = StyleSheet.create({
 	container: {
 		flex: 1,
 	},
+	bipPhrase: {
+		flex: 1,
+	},
 	bipCell: {
 		padding: 10,
+	},
+	bipText: {
+		lineHeight: 40,
+		paddingLeft: 4,
 	},
 	gridRow: {
 		flexDirection: 'row',
 	},
 	gridCell: {
 		flex: 1,
+	},
+	buttonDrawer: {
+		flexDirection: 'row',
+		borderColor: 'black',
+		borderLeftWidth: 1,
+		borderTopWidth: 1,
+		borderBottomWidth: 1,
+	},
+	button: {
+		flex: 1,
+		borderColor: 'black',
+		borderRightWidth: 1,
+	},
+	buttonText: {
+		textAlign: 'center',
+		margin: 20,
+		fontSize: 20,
+	},
+	buttonPressed: {
+		backgroundColor: '#2196F3',
+	},
+	buttonPressedText: {
+		color: 'white',
 	},
 	input: {
 		borderColor: '#b9b9b9',
