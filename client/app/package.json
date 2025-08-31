@@ -18,6 +18,8 @@
     "react-native": "0.81.0",
     "react-native-bare-kit": "latest",
     "react-native-keyboard-controller": "latest",
+    "react-native-nitro-modules": "latest",
+    "react-native-nitro-sqlite": "latest",
     "react-native-safe-area-context": "^5.5.2",
     "react-native-reanimated": "latest",
     "react-native-worklets": "latest",

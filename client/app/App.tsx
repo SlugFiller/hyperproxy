@@ -26,6 +26,7 @@ import type {
 	ReactNode,
 } from 'react';
 import {
+	ActivityIndicator,
 	FlatList,
 	Pressable,
 	StatusBar,
@@ -43,6 +44,10 @@ import {
 	Worklet,
 } from 'react-native-bare-kit';
 import {
+	enableSimpleNullHandling,
+	open,
+} from 'react-native-nitro-sqlite';
+import {
 	KeyboardAvoidingView,
 	KeyboardProvider,
 } from 'react-native-keyboard-controller';
@@ -54,6 +59,18 @@ import backendBundle from './backend.bundle.mjs'
 import {
 	RPC_KEYGEN,
 } from './backend/rpc-commands.mjs';
+
+enableSimpleNullHandling();
+
+const db = open({ name: 'config.sqlite' });
+db.execute(`CREATE TABLE IF NOT EXISTS keypair(
+	publicKey BLOB,
+	secretKey BLOB
+)`);
+
+function toBuffer(typedarray: Uint8Array): ArrayBuffer {
+	return typedarray.buffer.slice(typedarray.byteOffset, typedarray.byteOffset + typedarray.byteLength);
+}
 
 const App: FC = () => {
 	const isDarkMode = useColorScheme() === 'dark';
@@ -109,17 +126,43 @@ const AppContent: FC = () => {
 	}, [worklet]);
 
 	useEffect(() => {
+		// Attempt to load key from storage
+		do {
+			const keyPairRow = db.execute(`SELECT publicKey, secretKey FROM keypair LIMIT 1`).rows?.item(0);
+			if (!keyPairRow) {
+				break;
+			}
+			setKeyPair({
+				status: 'valid',
+				value: {
+					publicKey: new Uint8Array(keyPairRow.publicKey),
+					secretKey: new Uint8Array(keyPairRow.secretKey),
+				},
+			});
+			return;
+		}
+		while (false);
+
+		// Failed. Generate new key
 		const req = rpc.request(RPC_KEYGEN);
 		req.send(b4a.alloc(0));
 		req.reply().then((keyBundle: Uint8Array) => {
 			const pubKeyLen = b4a.readUInt32LE(keyBundle);
+			const newKeyPair = {
+				publicKey: keyBundle.subarray(4, 4 + pubKeyLen),
+				secretKey: keyBundle.subarray(4 + pubKeyLen, keyBundle.byteLength),
+			};
 			setKeyPair({
 				status: 'valid',
-				value: {
-					publicKey: keyBundle.subarray(4, 4 + pubKeyLen),
-					secretKey: keyBundle.subarray(4 + pubKeyLen, keyBundle.byteLength),
-				},
+				value: newKeyPair,
 			});
+			db.execute(`INSERT INTO keypair(publicKey, secretKey) SELECT ?, ?
+				FROM (SELECT 1 t) t LEFT JOIN keypair e ON (1=1) WHERE e.ROWID IS NULL`,
+				[
+					toBuffer(newKeyPair.publicKey),
+					toBuffer(newKeyPair.secretKey),
+				]
+			);
 		}, (error: Error) => {
 			setKeyPair({
 				status: 'error',
@@ -134,7 +177,7 @@ const AppContent: FC = () => {
 				{showKey ? (<>
 					{(() => { switch (keyPair.status) {
 						case 'loading': return (
-							<Text>Generating keypair...</Text>
+							<ActivityIndicator />
 						);
 						case 'error': return (
 							<View>
