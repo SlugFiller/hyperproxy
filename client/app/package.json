@@ -24,6 +24,7 @@
     "react-native-reanimated": "latest",
     "react-native-worklets": "latest",
     "sodium-native": "^5.0.8",
+    "toastify-react-native": "latest",
     "udx-native": "^1.19.0"
   },
   "devDependencies": {

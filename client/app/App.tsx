@@ -7,6 +7,7 @@
 
 import {
 	entropyToMnemonic,
+	mnemonicToEntropy,
 } from '@scure/bip39';
 import {
 	wordlist,
@@ -55,6 +56,9 @@ import {
 	SafeAreaProvider,
 	SafeAreaView,
 } from 'react-native-safe-area-context';
+import ToastManager, {
+	Toast,
+} from 'toastify-react-native'
 import backendBundle from './backend.bundle.mjs'
 import {
 	RPC_KEYGEN,
@@ -67,6 +71,11 @@ db.execute(`CREATE TABLE IF NOT EXISTS keypair(
 	publicKey BLOB,
 	secretKey BLOB
 )`);
+db.execute(`CREATE TABLE IF NOT EXISTS server(
+	name TEXT,
+	publicKey BLOB
+)`);
+db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS server__name ON server (name)`);
 
 function toBuffer(typedarray: Uint8Array): ArrayBuffer {
 	return typedarray.buffer.slice(typedarray.byteOffset, typedarray.byteOffset + typedarray.byteLength);
@@ -90,7 +99,7 @@ interface KeyPair {
 	secretKey: Uint8Array;
 }
 
-type KeyPairStatus = 
+type KeyPairStatus =
 	| {
 		status: 'loading',
 	}
@@ -100,14 +109,44 @@ type KeyPairStatus =
 	}
 	| {
 		status: 'error',
-		error: KeyPair,
+		error: Error,
 	}
 ;
 
 const AppContent: FC = () => {
+	type SelectedView =
+		| {
+			view: 'list',
+		}
+		| {
+			view: 'key',
+		}
+		| {
+			view: 'show',
+			name: string,
+			key: Uint8Array,
+		}
+		| {
+			view: 'add',
+		}
+		| {
+			view: 'edit',
+			name: string,
+		}
+	;
+
+	const [serverListReload, setServerListReload] = useState<Record<string, never>>({});
+	const [serverName, setServerName] = useState<string>('');
 	const [phrase, setPhrase] = useState<string>(' '.repeat(23));
 	const [keyPair, setKeyPair] = useState<KeyPairStatus>({ status: 'loading' });
-	const [showKey, setShowKey] = useState<boolean>(false);
+	const [selectedView, setSelectedView] = useState<SelectedView>({ view: 'list' });
+
+	let phraseDecoded: null | Uint8Array = null;
+	try {
+		phraseDecoded = mnemonicToEntropy(phrase, wordlist);
+	}
+	catch {
+	}
 
 	const worklet = useMemo(() => {
 		return new Worklet();
@@ -127,26 +166,23 @@ const AppContent: FC = () => {
 
 	useEffect(() => {
 		// Attempt to load key from storage
-		do {
-			const keyPairRow = db.execute(`SELECT publicKey, secretKey FROM keypair LIMIT 1`).rows?.item(0);
-			if (!keyPairRow) {
-				break;
+		(async () => {
+			const keyPairRow = (await db.executeAsync(`SELECT publicKey, secretKey FROM keypair LIMIT 1`)).rows?.item(0);
+			if (keyPairRow) {
+				setKeyPair({
+					status: 'valid',
+					value: {
+						publicKey: new Uint8Array(keyPairRow.publicKey),
+						secretKey: new Uint8Array(keyPairRow.secretKey),
+					},
+				});
+				return;
 			}
-			setKeyPair({
-				status: 'valid',
-				value: {
-					publicKey: new Uint8Array(keyPairRow.publicKey),
-					secretKey: new Uint8Array(keyPairRow.secretKey),
-				},
-			});
-			return;
-		}
-		while (false);
 
-		// Failed. Generate new key
-		const req = rpc.request(RPC_KEYGEN);
-		req.send(b4a.alloc(0));
-		req.reply().then((keyBundle: Uint8Array) => {
+			// Failed. Generate new key
+			const req = rpc.request(RPC_KEYGEN);
+			req.send(b4a.alloc(0));
+			const keyBundle: Uint8Array = await req.reply();
 			const pubKeyLen = b4a.readUInt32LE(keyBundle);
 			const newKeyPair = {
 				publicKey: keyBundle.subarray(4, 4 + pubKeyLen),
@@ -163,7 +199,7 @@ const AppContent: FC = () => {
 					toBuffer(newKeyPair.secretKey),
 				]
 			);
-		}, (error: Error) => {
+		})().catch((error: Error) => {
 			setKeyPair({
 				status: 'error',
 				error,
@@ -171,76 +207,321 @@ const AppContent: FC = () => {
 		});
 	}, [rpc]);
 
+	const selectServer = useCallback((name: string, key: Uint8Array) => {
+		setSelectedView({
+			view: 'show',
+			name,
+			key,
+		});
+	}, [setSelectedView]);
+
+	const addServer = useCallback(() => {
+		try {
+			if (serverName === '') {
+				throw new Error('Server name empty');
+			}
+			const serverKey = mnemonicToEntropy(phrase, wordlist);
+			// Queries that use buffer parameters must be sync
+			db.execute(`REPLACE INTO server(name, publicKey) VALUES (?, ?)`, [serverName, toBuffer(serverKey)]);
+			setServerListReload({});
+			setSelectedView({
+				view: 'list',
+			});
+		}
+		catch (error) {
+			error instanceof Error && Toast.error(error.message);
+		}
+	}, [serverName, phrase, setServerListReload]);
+
+	const editServer = useCallback((name: string) => {
+		try {
+			if (serverName === '') {
+				throw new Error('Server name empty');
+			}
+			const serverKey = mnemonicToEntropy(phrase, wordlist);
+			db.execute(`UPDATE OR REPLACE server SET name = ?, publicKey = ? WHERE name = ?`, [serverName, toBuffer(serverKey), name]);
+			setServerListReload({});
+			setSelectedView({
+				view: 'list',
+			});
+		}
+		catch (error) {
+			error instanceof Error && Toast.error(error.message);
+		}
+	}, [serverName, phrase, setServerListReload, setSelectedView]);
+
+	const moveToEdit = useCallback((name: string, key: Uint8Array) => {
+		setServerName(name);
+		setPhrase(entropyToMnemonic(key, wordlist));
+		setSelectedView({
+			view: 'edit',
+			name: name,
+		});
+	}, [setServerName, setPhrase, setSelectedView]);
+
 	return (
 		<SafeAreaView style={styles.container}>
 			<KeyboardAvoidingView behavior={"height"} style={styles.container}>
-				{showKey ? (<>
-					{(() => { switch (keyPair.status) {
-						case 'loading': return (
-							<ActivityIndicator />
+				<View style={styles.content}>
+					<View style={selectedView.view === 'list' ? styles.container : styles.hidden}>
+						<ServerList onSelect={selectServer} reload={serverListReload} />
+					</View>
+					{(() => { switch (selectedView.view) {
+						case 'key': return (
+							<KeyView keyPair={keyPair} />
 						);
-						case 'error': return (
-							<View>
-								<Text>Error</Text>
-								<Text>{keyPair.error.message}</Text>
-								<Text>{keyPair.error.stack}</Text>
+						case 'show': return (<>
+							<View style={styles.editNameContainer}>
+								<Text style={styles.serverNameLabel}>Server name:</Text>
+								<Text style={styles.serverNameText}>{selectedView.name}</Text>
 							</View>
-						);
-						case 'valid': return (
-							<Bip39Display
-								value={entropyToMnemonic(keyPair.value.publicKey, wordlist)}
+							<ServiceList keyPair={keyPair} serverKey={selectedView.key} />
+						</>)
+						case 'add':
+						case 'edit': return (<>
+							<View style={styles.editNameContainer}>
+								<Text style={styles.serverNameLabel}>Server name:</Text>
+								<TextInput value={serverName} onChangeText={setServerName} style={[styles.input]} />
+							</View>
+							<Bip39Phrase
+								value={phrase}
+								setValue={setPhrase}
 								numColumns={4}
 								style={styles.bipPhrase}
 								cellStyle={styles.bipCell}
-								textStyle={styles.bipText}
 							/>
-						);
+						</>)
 					} })()}
-				</>) : (
-					<Bip39Phrase
-						value={phrase}
-						setValue={setPhrase}
-						numColumns={4}
-						style={styles.bipPhrase}
-						cellStyle={styles.bipCell}
-					/>
-				)}
+				</View>
 				<View style={styles.buttonDrawer}>
-					{showKey ? (
+					{selectedView.view === 'list' ? (<>
 						<TextButton
-							title="Back"
-							onPress={() => setShowKey(false)}
+							title="Add"
+							onPress={() => setSelectedView({ view: 'add' })}
 							style={styles.button}
 							stylePressed={styles.buttonPressed}
 							styleText={styles.buttonText}
 							stylePressedText={styles.buttonPressedText}
 						/>
-					) : (
 						<TextButton
 							title="Show my key"
-							onPress={() => setShowKey(true)}
+							onPress={() => setSelectedView({ view: 'key' })}
 							style={styles.button}
 							stylePressed={styles.buttonPressed}
 							styleText={styles.buttonText}
 							stylePressedText={styles.buttonPressedText}
 						/>
-					)}
+					</>) : (<>
+						<TextButton
+							title="Back"
+							onPress={() => setSelectedView({ view: 'list' })}
+							style={styles.button}
+							stylePressed={styles.buttonPressed}
+							styleText={styles.buttonText}
+							stylePressedText={styles.buttonPressedText}
+						/>
+						{(() => { switch (selectedView.view) {
+							case 'show': return (
+								<TextButton
+									title="Edit"
+									onPress={() => moveToEdit(selectedView.name, selectedView.key)}
+									style={styles.button}
+									stylePressed={styles.buttonPressed}
+									styleText={styles.buttonText}
+									stylePressedText={styles.buttonPressedText}
+								/>
+							)
+							case 'add': return (
+								<TextButton
+									title="Add"
+									disabled={serverName === '' || phraseDecoded === null}
+									onPress={addServer}
+									style={styles.button}
+									stylePressed={styles.buttonPressed}
+									styleDisabled={styles.buttonDisabled}
+									styleText={styles.buttonText}
+									stylePressedText={styles.buttonPressedText}
+									styleDisabledText={styles.buttonDisabledText}
+								/>
+							)
+							case 'edit': return (
+								<TextButton
+									title="Save"
+									disabled={serverName === '' || phraseDecoded === null}
+									onPress={() => editServer(selectedView.name)}
+									style={styles.button}
+									stylePressed={styles.buttonPressed}
+									styleDisabled={styles.buttonDisabled}
+									styleText={styles.buttonText}
+									stylePressedText={styles.buttonPressedText}
+									styleDisabledText={styles.buttonDisabledText}
+								/>
+							)
+						} })()}
+					</>)}
 				</View>
 			</KeyboardAvoidingView>
+			<ToastManager
+				position="center"
+			/>
 		</SafeAreaView>
+	);
+};
+
+interface KeyViewProps {
+	keyPair: KeyPairStatus;
+}
+
+const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
+	switch (keyPair.status) {
+		case 'loading': return (
+			<ActivityIndicator size="large" />
+		);
+		case 'error': return (
+			<View>
+				<Text>Error</Text>
+				<Text>{keyPair.error.message}</Text>
+				<Text>{keyPair.error.stack}</Text>
+			</View>
+		);
+		case 'valid': return (
+			<Bip39Display
+				value={entropyToMnemonic(keyPair.value.publicKey, wordlist)}
+				numColumns={4}
+				style={styles.bipPhrase}
+				cellStyle={styles.bipCell}
+				textStyle={styles.bipText}
+			/>
+		);
+	}
+};
+
+interface ServerListProps {
+	onSelect?: (name: string, key: Uint8Array) => void;
+	reload: Record<string, never>;
+}
+
+const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
+	interface Server {
+		name: string;
+		key: Uint8Array;
+	}
+
+	type ServerListStatus =
+		| {
+			status: 'loading',
+		}
+		| {
+			status: 'error',
+			error: Error,
+		}
+		| {
+			status: 'valid',
+			list: Server[],
+		}
+	;
+
+	const [serverList, setServerList] = useState<ServerListStatus>({ status: 'loading' });
+
+	useEffect(() => {
+		let active = true;
+		(async () => {
+			const { rows } = await db.executeAsync(`SELECT name, publicKey FROM server ORDER BY name ASC`);
+			if (!active) {
+				return;
+			}
+			if (!rows) {
+				setServerList({ status: 'valid', list: [] });
+				return;
+			}
+			const list: Server[] = [];
+			for (let i = 0; i < rows.length; i++) {
+				const row = rows.item(i);
+				list.push({
+					name: row.name,
+					key: new Uint8Array(row.publicKey),
+				});
+			}
+			setServerList({
+				status: 'valid',
+				list,
+			});
+		})().catch((error: Error) => {
+			if (!active) {
+				return;
+			}
+			setServerList({
+				status: 'error',
+				error,
+			});
+		});
+		return () => {
+			active = false;
+		};
+	}, [setServerList, reload]);
+
+	switch (serverList.status) {
+		case 'loading': return (
+			<ActivityIndicator size="large" />
+		);
+		case 'error': return (
+			<View>
+				<Text>Error</Text>
+				<Text>{serverList.error.message}</Text>
+				<Text>{serverList.error.stack}</Text>
+			</View>
+		);
+		case 'valid': return (
+			<FlatList
+				data={serverList.list}
+				keyExtractor={({ name }: Server) => name}
+				renderItem={({ item: { name, key }}: { item: Server }) => (
+					<Pressable onPress={() => onSelect(name, key)}>
+						{({ pressed }) => (
+							<Text style={pressed ? [styles.serverListItem, styles.serverListItemPressed] : [styles.serverListItem]}>{name}</Text>
+						)}
+					</Pressable>
+				)}
+				ItemSeparatorComponent={(
+					<View style={styles.serverListSeparator} />
+				)}
+			/>
+		);
+	}
+};
+
+
+interface ServiceListProps {
+	keyPair: KeyPairStatus;
+	serverKey: Uint8Array;
+}
+
+const ServiceList: FC<ServiceListProps> = () => {
+	return (
+		<ActivityIndicator size="large" />
 	);
 };
 
 interface TextButtonProps {
 	title: string;
-	onPress: () => void;
-	style: StyleProp<ViewStyle>;
-	styleText: StyleProp<ViewStyle>;
-	stylePressed: StyleProp<ViewStyle>;
-	stylePressedText: StyleProp<ViewStyle>;
+	disabled?: boolean;
+	onPress?: () => void;
+	style?: StyleProp<ViewStyle>;
+	styleText?: StyleProp<ViewStyle>;
+	stylePressed?: StyleProp<ViewStyle>;
+	stylePressedText?: StyleProp<ViewStyle>;
+	styleDisabled?: StyleProp<ViewStyle>;
+	styleDisabledText?: StyleProp<ViewStyle>;
 }
 
-const TextButton: FC<TextButtonProps> = ({ title, onPress, style, styleText, stylePressed, stylePressedText}) => {
+const TextButton: FC<TextButtonProps> = ({ title, disabled, onPress, style, styleText, stylePressed, stylePressedText, styleDisabled, styleDisabledText}) => {
+	if (disabled) {
+		return (
+			<View style={[style, styleDisabled]}>
+				<Text style={[styleText, styleDisabledText]}>{title}</Text>
+			</View>
+		);
+	}
 	return (
 		<Pressable
 			onPress={onPress}
@@ -285,7 +566,7 @@ const Bip39Phrase: FC<Bip39PhraseProps> = ({ value, setValue, ...props }) => {
 				<Bip39Word
 					boundary={boundary}
 					value={word}
-					setValue={(v: string) => setValue(words.map((w, i) => i === index ? v : w).join(' '))}
+					setValue={(v: string) => setValue(words.map((w, i) => i === index ? v.replace(/[^a-z]/g, '') : w).join(' '))}
 				/>
 			))}
 		</Grid>
@@ -335,14 +616,12 @@ const Bip39Word: FC<Bip39WordProps> = ({ value, setValue, boundary, ...props }) 
 	}, [boundary, value]);
 
 	const data = useMemo<string[]>(() => {
-		if (!value.length) {
+		if (!value.length || wordlist.filter((word) => word === value).length > 0) {
+			// FIXME: Instead of hiding the list on exact match, actually track focus and click
+			// and hide based on status
 			return [];
 		}
-		const ret: string[] = wordlist.filter((word) => word.startsWith(value));
-		if (ret.length === 1 && ret[0] === value) {
-			return [];
-		}
-		return ret;
+		return wordlist.filter((word) => word.startsWith(value));
 	}, [value]);
 
 	return (
@@ -353,6 +632,7 @@ const Bip39Word: FC<Bip39WordProps> = ({ value, setValue, boundary, ...props }) 
 			{data.length > 0 && (
 				<View collapsable={false} style={[floatStyle, styles.autoCompleteContainer]}>
 					<FlatList
+						keyboardShouldPersistTaps="always"
 						data={data}
 						renderItem={({ item }: { item: string }) => (
 							<Pressable onPress={() => setValue(item)}>
@@ -433,8 +713,26 @@ const styles = StyleSheet.create({
 	container: {
 		flex: 1,
 	},
+	hidden: {
+		display: 'none',
+	},
+	content: {
+		flexGrow: 1,
+		overflow: 'scroll',
+	},
+	serverListItem: {
+		fontSize: 22,
+		padding: 20,
+	},
+	serverListItemPressed: {
+		backgroundColor: '#2196f3',
+	},
+	serverListSeparator: {
+		height: 1,
+		backgroundColor: '#000000',
+	},
 	bipPhrase: {
-		flex: 1,
+		flexGrow: 1,
 	},
 	bipCell: {
 		padding: 10,
@@ -449,6 +747,17 @@ const styles = StyleSheet.create({
 	gridCell: {
 		flex: 1,
 	},
+	editNameContainer: {
+		flexDirection: 'row',
+		padding: 20,
+	},
+	serverNameLabel: {
+		lineHeight: 40,
+		paddingRight: 12,
+	},
+	serverNameText: {
+		lineHeight: 40,
+	},
 	buttonDrawer: {
 		flexDirection: 'row',
 		borderColor: 'black',
@@ -457,9 +766,11 @@ const styles = StyleSheet.create({
 		borderBottomWidth: 1,
 	},
 	button: {
-		flex: 1,
+		flexGrow: 1,
 		borderColor: 'black',
 		borderRightWidth: 1,
+		backgroundColor: 'white',
+		justifyContent: 'center',
 	},
 	buttonText: {
 		textAlign: 'center',
@@ -467,10 +778,16 @@ const styles = StyleSheet.create({
 		fontSize: 20,
 	},
 	buttonPressed: {
-		backgroundColor: '#2196F3',
+		backgroundColor: '#2196f3',
 	},
 	buttonPressedText: {
 		color: 'white',
+	},
+	buttonDisabled: {
+		backgroundColor: '#f0f0f0',
+	},
+	buttonDisabledText: {
+		color: '#b0b0b0',
 	},
 	input: {
 		borderColor: '#b9b9b9',
@@ -479,6 +796,7 @@ const styles = StyleSheet.create({
 		backgroundColor: 'white',
 		height: 40,
 		paddingLeft: 3,
+		flex: 1,
 	},
 	autoCompleteContainer: {
 		borderColor: '#b9b9b9',
