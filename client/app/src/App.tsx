@@ -5,6 +5,7 @@
  * @format
  */
 
+import './polyfills.mjs'
 import {
 	entropyToMnemonic,
 	mnemonicToEntropy,
@@ -12,8 +13,6 @@ import {
 import {
 	wordlist,
 } from '@scure/bip39/wordlists/english';
-import b4a from 'b4a';
-import RPC from 'bare-rpc';
 import {
 	Children,
 	useCallback,
@@ -25,6 +24,7 @@ import {
 import type {
 	FC,
 	ReactNode,
+	RefAttributes,
 } from 'react';
 import {
 	ActivityIndicator,
@@ -39,6 +39,8 @@ import {
 } from 'react-native';
 import type {
 	StyleProp,
+	TextStyle,
+	ViewProps,
 	ViewStyle,
 } from 'react-native';
 import {
@@ -59,10 +61,20 @@ import {
 import ToastManager, {
 	Toast,
 } from 'toastify-react-native'
-import backendBundle from './backend.bundle.mjs'
+import {
+	StreamSplitter,
+	combineStreams,
+	consumeBuffer,
+	packetUInt32LE,
+	readerFromNodeStream,
+	runStream,
+	streamPacketer,
+	writerFromNodeStream,
+} from './parse-utils.mjs'
+import backendBundle from '../backend.bundle.mjs'
 import {
 	RPC_KEYGEN,
-} from './backend/rpc-commands.mjs';
+} from '../backend/rpc-commands.mjs';
 
 enableSimpleNullHandling();
 
@@ -77,7 +89,7 @@ db.execute(`CREATE TABLE IF NOT EXISTS server(
 )`);
 db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS server__name ON server (name)`);
 
-function toBuffer(typedarray: Uint8Array): ArrayBuffer {
+function toBuffer(typedarray: Uint8Array<ArrayBuffer>): ArrayBuffer {
 	return typedarray.buffer.slice(typedarray.byteOffset, typedarray.byteOffset + typedarray.byteLength);
 }
 
@@ -95,8 +107,8 @@ const App: FC = () => {
 };
 
 interface KeyPair {
-	publicKey: Uint8Array;
-	secretKey: Uint8Array;
+	publicKey: Uint8Array<ArrayBuffer>;
+	secretKey: Uint8Array<ArrayBuffer>;
 }
 
 type KeyPairStatus =
@@ -124,7 +136,7 @@ const AppContent: FC = () => {
 		| {
 			view: 'show',
 			name: string,
-			key: Uint8Array,
+			key: Uint8Array<ArrayBuffer>,
 		}
 		| {
 			view: 'add',
@@ -152,22 +164,30 @@ const AppContent: FC = () => {
 		return new Worklet();
 	}, []);
 
+	const splitter = useMemo(() => {
+		return new StreamSplitter();
+	}, []);
+
 	useEffect(() => {
 		worklet.start('/backend.bundle', backendBundle);
 
+		const controller = new AbortController();
+		runStream(combineStreams(
+			readerFromNodeStream(worklet.IPC),
+			splitter.split,
+			writerFromNodeStream(worklet.IPC)
+		), { signal: controller.signal }).catch(() => {
+			// If we're here, it's most likely due to abort. Ignore
+		});
 		return () => {
-			worklet.IPC.destroy();
+			controller.abort();
 		};
-	}, [worklet]);
-
-	const rpc = useMemo(() => {
-		return new RPC(worklet.IPC);
-	}, [worklet]);
+	}, [worklet, splitter]);
 
 	useEffect(() => {
 		// Attempt to load key from storage
 		(async () => {
-			const keyPairRow = (await db.executeAsync(`SELECT publicKey, secretKey FROM keypair LIMIT 1`)).rows?.item(0);
+			const keyPairRow = (await db.executeAsync<{ publicKey: ArrayBuffer, secretKey: ArrayBuffer }>(`SELECT publicKey, secretKey FROM keypair LIMIT 1`)).rows?.item(0);
 			if (keyPairRow) {
 				setKeyPair({
 					status: 'valid',
@@ -180,14 +200,19 @@ const AppContent: FC = () => {
 			}
 
 			// Failed. Generate new key
-			const req = rpc.request(RPC_KEYGEN);
-			req.send(b4a.alloc(0));
-			const keyBundle: Uint8Array = await req.reply();
-			const pubKeyLen = b4a.readUInt32LE(keyBundle);
-			const newKeyPair = {
-				publicKey: keyBundle.subarray(4, 4 + pubKeyLen),
-				secretKey: keyBundle.subarray(4 + pubKeyLen, keyBundle.byteLength),
-			};
+			const newKeyPair = await new Promise<KeyPair>((resolve) => {
+				splitter.createStream(async function* (stream) {
+					yield packetUInt32LE(RPC_KEYGEN);
+					for await (const packeter of streamPacketer(stream())) {
+						const publicKey = await consumeBuffer(packeter);
+						const secretKey = await consumeBuffer(packeter);
+						resolve({
+							publicKey,
+							secretKey,
+						});
+					}
+				});
+			});
 			setKeyPair({
 				status: 'valid',
 				value: newKeyPair,
@@ -205,9 +230,9 @@ const AppContent: FC = () => {
 				error,
 			});
 		});
-	}, [rpc]);
+	}, [splitter]);
 
-	const selectServer = useCallback((name: string, key: Uint8Array) => {
+	const selectServer = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
 		setSelectedView({
 			view: 'show',
 			name,
@@ -220,7 +245,7 @@ const AppContent: FC = () => {
 			if (serverName === '') {
 				throw new Error('Server name empty');
 			}
-			const serverKey = mnemonicToEntropy(phrase, wordlist);
+			const serverKey = mnemonicToEntropy(phrase, wordlist) as Uint8Array<ArrayBuffer>;
 			// Queries that use buffer parameters must be sync
 			db.execute(`REPLACE INTO server(name, publicKey) VALUES (?, ?)`, [serverName, toBuffer(serverKey)]);
 			setServerListReload({});
@@ -238,7 +263,7 @@ const AppContent: FC = () => {
 			if (serverName === '') {
 				throw new Error('Server name empty');
 			}
-			const serverKey = mnemonicToEntropy(phrase, wordlist);
+			const serverKey = mnemonicToEntropy(phrase, wordlist) as Uint8Array<ArrayBuffer>;
 			db.execute(`UPDATE OR REPLACE server SET name = ?, publicKey = ? WHERE name = ?`, [serverName, toBuffer(serverKey), name]);
 			setServerListReload({});
 			setSelectedView({
@@ -250,7 +275,7 @@ const AppContent: FC = () => {
 		}
 	}, [serverName, phrase, setServerListReload, setSelectedView]);
 
-	const moveToEdit = useCallback((name: string, key: Uint8Array) => {
+	const moveToEdit = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
 		setServerName(name);
 		setPhrase(entropyToMnemonic(key, wordlist));
 		setSelectedView({
@@ -397,14 +422,14 @@ const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
 };
 
 interface ServerListProps {
-	onSelect?: (name: string, key: Uint8Array) => void;
+	onSelect?: (name: string, key: Uint8Array<ArrayBuffer>) => void;
 	reload: Record<string, never>;
 }
 
 const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 	interface Server {
 		name: string;
-		key: Uint8Array;
+		key: Uint8Array<ArrayBuffer>;
 	}
 
 	type ServerListStatus =
@@ -426,7 +451,7 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 	useEffect(() => {
 		let active = true;
 		(async () => {
-			const { rows } = await db.executeAsync(`SELECT name, publicKey FROM server ORDER BY name ASC`);
+			const { rows } = await db.executeAsync<{ name: string, publicKey: ArrayBuffer }>(`SELECT name, publicKey FROM server ORDER BY name ASC`);
 			if (!active) {
 				return;
 			}
@@ -436,7 +461,7 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 			}
 			const list: Server[] = [];
 			for (let i = 0; i < rows.length; i++) {
-				const row = rows.item(i);
+				const row = rows.item(i)!;
 				list.push({
 					name: row.name,
 					key: new Uint8Array(row.publicKey),
@@ -475,21 +500,26 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 			<FlatList
 				data={serverList.list}
 				keyExtractor={({ name }: Server) => name}
-				renderItem={({ item: { name, key }}: { item: Server }) => (
+				renderItem={({ item: { name, key }}: { item: Server }) => onSelect ? (
 					<Pressable onPress={() => onSelect(name, key)}>
 						{({ pressed }) => (
 							<Text style={pressed ? [styles.serverListItem, styles.serverListItemPressed] : [styles.serverListItem]}>{name}</Text>
 						)}
 					</Pressable>
+				): (
+					<Text style={[styles.serverListItem]}>{name}</Text>
 				)}
-				ItemSeparatorComponent={(
-					<View style={styles.serverListSeparator} />
-				)}
+				ItemSeparatorComponent={ServerListSeparatorComponent}
 			/>
 		);
 	}
 };
 
+const ServerListSeparatorComponent: FC = () => {
+	return (
+		<View style={styles.serverListSeparator} collapsable={false} />
+	);
+};
 
 interface ServiceListProps {
 	keyPair: KeyPairStatus;
@@ -507,11 +537,11 @@ interface TextButtonProps {
 	disabled?: boolean;
 	onPress?: () => void;
 	style?: StyleProp<ViewStyle>;
-	styleText?: StyleProp<ViewStyle>;
+	styleText?: StyleProp<TextStyle>;
 	stylePressed?: StyleProp<ViewStyle>;
-	stylePressedText?: StyleProp<ViewStyle>;
+	stylePressedText?: StyleProp<TextStyle>;
 	styleDisabled?: StyleProp<ViewStyle>;
-	styleDisabledText?: StyleProp<ViewStyle>;
+	styleDisabledText?: StyleProp<TextStyle>;
 }
 
 const TextButton: FC<TextButtonProps> = ({ title, disabled, onPress, style, styleText, stylePressed, stylePressedText, styleDisabled, styleDisabledText}) => {
@@ -534,7 +564,7 @@ const TextButton: FC<TextButtonProps> = ({ title, disabled, onPress, style, styl
 	);
 };
 
-interface Bip39PhraseProps {
+interface Bip39PhraseProps extends Omit<GridProps, 'children'> {
 	value: string;
 	setValue: React.Dispatch<React.SetStateAction<string>>;
 }
@@ -561,12 +591,12 @@ const Bip39Phrase: FC<Bip39PhraseProps> = ({ value, setValue, ...props }) => {
 	}, []);
 
 	return (
-		<Grid ref={boundaryRef} onLayout={handleLayout} {...props}>
+		<Grid ref={boundaryRef} collapsable={false} onLayout={handleLayout} {...props}>
 			{words.map((word, index) => (
 				<Bip39Word
 					boundary={boundary}
 					value={word}
-					setValue={(v: string) => setValue(words.map((w, i) => i === index ? v.replace(/[^a-z]/g, '') : w).join(' '))}
+					setValue={(v: React.SetStateAction<string>) => setValue(words.map((w, i) => i === index ? (typeof v === 'function' ? v(w) : v).replace(/[^a-z]/g, '') : w).join(' '))}
 				/>
 			))}
 		</Grid>
@@ -646,7 +676,7 @@ const Bip39Word: FC<Bip39WordProps> = ({ value, setValue, boundary, ...props }) 
 	);
 }
 
-interface Bip39DisplayProps {
+interface Bip39DisplayProps extends Omit<GridProps, 'children'> {
 	value: string;
 	textStyle?: StyleProp<ViewStyle>;
 }
@@ -663,11 +693,10 @@ const Bip39Display: FC<Bip39DisplayProps> = ({ value, textStyle, ...props }) => 
 	);
 };
 
-interface GridProps {
+interface GridProps extends ViewProps, RefAttributes<View> {
 	rowStyle?: StyleProp<ViewStyle>;
 	cellStyle?: StyleProp<ViewStyle>;
 	numColumns: number;
-	children: ReactNode;
 }
 
 const Grid: FC<GridProps> = ({ rowStyle, cellStyle, numColumns, children, ...props }) => {

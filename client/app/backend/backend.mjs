@@ -1,25 +1,46 @@
 // /* global Bare, BareKit */
 
-import RPC from 'bare-rpc';
+import '../src/polyfills.mjs';
 import DHT from 'hyperdht';
 import {
 	RPC_KEYGEN,
-} from './rpc-commands.mjs'
+	RPC_LIST,
+} from './rpc-commands.mjs';
+import {
+	StreamSplitter,
+	combineStreams,
+	consumeUInt32LE,
+	packetUInt32LE,
+	readerFromNodeStream,
+	runStream,
+	streamPacketer,
+	writerFromNodeStream,
+} from '../src/parse-utils.mjs';
 
-const rpc = new RPC(BareKit.IPC, async (req) => {
-	try {
-		switch (req.command) {
+const splitter = new StreamSplitter(async function* (stream, { signal }) {
+	for await (const packeter of streamPacketer(stream({ signal }))) {
+		switch (await consumeUInt32LE(packeter)) {
 			case RPC_KEYGEN: {
 				const key = DHT.keyPair();
-				const pubKeyLen = Buffer.alloc(4);
-				pubKeyLen.writeUInt32LE(key.publicKey.length);
-				req.reply(Buffer.concat([pubKeyLen, key.publicKey, key.secretKey]));
+				yield packetUInt32LE(key.publicKey.byteLength);
+				yield key.publicKey;
+				yield packetUInt32LE(key.secretKey.byteLength);
+				yield key.secretKey;
+				break;
+			}
+			case RPC_LIST: {
 			}
 		}
 	}
-	finally {
-		if (!req.sent) {
-			throw new Error('Command not handled');
-		}
-	}
 });
+
+try {
+	await runStream(combineStreams(
+		readerFromNodeStream(BareKit.IPC),
+		splitter.split,
+		writerFromNodeStream(BareKit.IPC)
+	));
+}
+catch (e) {
+	console.log(e);
+}

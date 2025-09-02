@@ -1,6 +1,6 @@
 {
 	"dependencies": {
-		"bare-rpc": "latest",
+		"b4a": "latest",
 		"hyperdht": "latest"
 	}
 }

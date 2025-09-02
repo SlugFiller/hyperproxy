@@ -53,6 +53,8 @@ COPY ./app /usr/src/app/
 
 RUN npx bare-pack --target android --linked --out ./backend.bundle.mjs backend/backend.mjs
 
+RUN npx tsc --noEmit
+
 RUN npm run lint
 
 CMD ["npm", "run", "start"]
