@@ -13,8 +13,17 @@ import {
 	fileURLToPath,
 } from 'node:url';
 import {
-	pipeline,
-} from 'node:stream/promises';
+	combineStreams,
+	consumeUInt32LE,
+	packetUInt32LE,
+	readerFromNodeStream,
+	runStream,
+	streamPacketer,
+	writerFromNodeStream,
+} from './parse-utils.mjs';
+import {
+	RPC_LIST,
+} from './rpc-commands.mjs';
 
 const db = new DatabaseSync(fileURLToPath(new URL('config.sqlite', import.meta.url)));
 
@@ -45,12 +54,28 @@ const server = node.createServer();
 
 server.on('connection', function (socket) {
 	console.log('Connection from socket', entropyToMnemonic(socket.remotePublicKey, wordlist));
-	pipeline(
-		socket,
-		async function* (source, { signal }) {
+	runStream(combineStreams(
+		readerFromNodeStream(socket),
+		async function* (source, { signal } = {}) {
+			for await (const packeter of streamPacketer(source({ signal }))) {
+				switch (await consumeUInt32LE(packeter)) {
+					case RPC_LIST: {
+						for (const name of ['Placeholder', 'Dummy', 'Foobar']) {
+							const service = Buffer.from(name);
+							yield packetUInt32LE(service.byteLength);
+							yield service;
+						}
+					}
+				}
+			}
 		},
-		socket
-	);
+		writerFromNodeStream(socket)
+	)).catch((e) => {
+		console.log(e);
+		socket.destroy(e);
+	}).then(() => {
+		socket.destroy();
+	});
 });
 
 await server.listen(keyPair)

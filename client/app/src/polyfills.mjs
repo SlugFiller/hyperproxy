@@ -218,6 +218,9 @@ if (typeof global.AbortSignal === 'undefined' || typeof global.AbortSignal.abort
 			controller.signal.addEventListener('abort', weakabort);
 			controller.signal.#refobject = controller;
 			for (const signal of signals) {
+				if (!signal) {
+					continue;
+				}
 				if (signal.aborted) {
 					controller.abort(signal.reason);
 					return;

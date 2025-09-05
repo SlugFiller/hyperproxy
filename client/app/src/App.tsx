@@ -13,6 +13,7 @@ import {
 import {
 	wordlist,
 } from '@scure/bip39/wordlists/english';
+import b4a from 'b4a';
 import {
 	Children,
 	useCallback,
@@ -63,6 +64,7 @@ import ToastManager, {
 } from 'toastify-react-native'
 import {
 	StreamSplitter,
+	anyPacket,
 	combineStreams,
 	consumeBuffer,
 	packetUInt32LE,
@@ -74,6 +76,7 @@ import {
 import backendBundle from '../backend.bundle.mjs'
 import {
 	RPC_KEYGEN,
+	RPC_LIST,
 } from '../backend/rpc-commands.mjs';
 
 enableSimpleNullHandling();
@@ -117,7 +120,8 @@ type KeyPairStatus =
 	}
 	| {
 		status: 'valid',
-		value: KeyPair,
+		publicKey: Uint8Array<ArrayBuffer>,
+		secretKey: Uint8Array<ArrayBuffer>,
 	}
 	| {
 		status: 'error',
@@ -185,25 +189,28 @@ const AppContent: FC = () => {
 	}, [worklet, splitter]);
 
 	useEffect(() => {
-		// Attempt to load key from storage
+		const controller = new AbortController();
+
 		(async () => {
+			// Attempt to load key from storage
 			const keyPairRow = (await db.executeAsync<{ publicKey: ArrayBuffer, secretKey: ArrayBuffer }>(`SELECT publicKey, secretKey FROM keypair LIMIT 1`)).rows?.item(0);
 			if (keyPairRow) {
+				if (controller.signal.aborted) {
+					return;
+				}
 				setKeyPair({
 					status: 'valid',
-					value: {
-						publicKey: new Uint8Array(keyPairRow.publicKey),
-						secretKey: new Uint8Array(keyPairRow.secretKey),
-					},
+					publicKey: new Uint8Array(keyPairRow.publicKey),
+					secretKey: new Uint8Array(keyPairRow.secretKey),
 				});
 				return;
 			}
 
 			// Failed. Generate new key
 			const newKeyPair = await new Promise<KeyPair>((resolve) => {
-				splitter.createStream(async function* (stream) {
+				splitter.createStream(async function* (stream, { signal } = {}) {
 					yield packetUInt32LE(RPC_KEYGEN);
-					for await (const packeter of streamPacketer(stream())) {
+					for await (const packeter of streamPacketer(stream({ signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }))) {
 						const publicKey = await consumeBuffer(packeter);
 						const secretKey = await consumeBuffer(packeter);
 						resolve({
@@ -213,9 +220,13 @@ const AppContent: FC = () => {
 					}
 				});
 			});
+			if (controller.signal.aborted) {
+				return;
+			}
 			setKeyPair({
 				status: 'valid',
-				value: newKeyPair,
+				publicKey: newKeyPair.publicKey,
+				secretKey: newKeyPair.secretKey,
 			});
 			db.execute(`INSERT INTO keypair(publicKey, secretKey) SELECT ?, ?
 				FROM (SELECT 1 t) t LEFT JOIN keypair e ON (1=1) WHERE e.ROWID IS NULL`,
@@ -225,11 +236,18 @@ const AppContent: FC = () => {
 				]
 			);
 		})().catch((error: Error) => {
+			if (controller.signal.aborted) {
+				return;
+			}
 			setKeyPair({
 				status: 'error',
 				error,
 			});
 		});
+
+		return () => {
+			controller.abort();
+		};
 	}, [splitter]);
 
 	const selectServer = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
@@ -300,7 +318,7 @@ const AppContent: FC = () => {
 								<Text style={styles.serverNameLabel}>Server name:</Text>
 								<Text style={styles.serverNameText}>{selectedView.name}</Text>
 							</View>
-							<ServiceList keyPair={keyPair} serverKey={selectedView.key} />
+							<ServiceList keyPair={keyPair} serverKey={selectedView.key} streamSplitter={splitter} />
 						</>)
 						case 'add':
 						case 'edit': return (<>
@@ -411,7 +429,7 @@ const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
 		);
 		case 'valid': return (
 			<Bip39Display
-				value={entropyToMnemonic(keyPair.value.publicKey, wordlist)}
+				value={entropyToMnemonic(keyPair.publicKey, wordlist)}
 				numColumns={4}
 				style={styles.bipPhrase}
 				cellStyle={styles.bipCell}
@@ -500,7 +518,7 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 			<FlatList
 				data={serverList.list}
 				keyExtractor={({ name }: Server) => name}
-				renderItem={({ item: { name, key }}: { item: Server }) => onSelect ? (
+				renderItem={({ item: { name, key } }: { item: Server }) => onSelect ? (
 					<Pressable onPress={() => onSelect(name, key)}>
 						{({ pressed }) => (
 							<Text style={pressed ? [styles.serverListItem, styles.serverListItemPressed] : [styles.serverListItem]}>{name}</Text>
@@ -522,13 +540,79 @@ const ServerListSeparatorComponent: FC = () => {
 };
 
 interface ServiceListProps {
+	onSelect?: (name: string) => void;
 	keyPair: KeyPairStatus;
-	serverKey: Uint8Array;
+	serverKey: Uint8Array<ArrayBuffer>;
+	streamSplitter: StreamSplitter;
 }
 
-const ServiceList: FC<ServiceListProps> = () => {
+const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, streamSplitter: splitter, onSelect }) => {
+	const [services, setServices] = useState<string[]>([]);
+	const [loading, setLoading] = useState<boolean>(true);
+
+	useEffect(() => {
+		if (keyPair.status !== 'valid') {
+			return;
+		}
+
+		setLoading(true);
+
+		const controller = new AbortController();
+		const gotServices: string[] = [];
+
+		splitter.createStream(async function* (stream, { signal } = {}) {
+			yield packetUInt32LE(RPC_LIST);
+			yield packetUInt32LE(keyPair.publicKey.byteLength);
+			yield keyPair.publicKey;
+			yield packetUInt32LE(keyPair.secretKey.byteLength);
+			yield keyPair.secretKey;
+			yield packetUInt32LE(serverKey.byteLength);
+			yield serverKey;
+			for await (const packeter of streamPacketer(stream({ signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }))) {
+				while (await anyPacket(packeter)) {
+					const service = b4a.toString(await consumeBuffer(packeter));
+					gotServices.push(service);
+					setServices([...gotServices]);
+				}
+			}
+			setLoading(false);
+		});
+
+		return () => {
+			controller.abort();
+		};
+	}, [keyPair, serverKey, splitter]);
+
 	return (
-		<ActivityIndicator size="large" />
+		<View style={styles.container}>
+			{loading && (
+				<ActivityIndicator size="large" style={styles.floatingLoader} />
+			)}
+			{services.length && (
+				<FlatList
+					data={services}
+					keyExtractor={(name) => name}
+					renderItem={({ item: name }: { item: string }) => onSelect ? (
+						<Pressable onPress={() => onSelect(name)}>
+							{({ pressed }) => (
+								<Text style={pressed ? [styles.serviceListItem, styles.serviceListItemPressed] : [styles.serviceListItem]}>{name}</Text>
+							)}
+						</Pressable>
+					): (
+						<Text style={[styles.serviceListItem]}>{name}</Text>
+					)}
+					ItemSeparatorComponent={ServiceListSeparatorComponent}
+				/>
+			) || (!loading && (
+				<Text>No services found</Text>
+			))}
+		</View>
+	);
+};
+
+const ServiceListSeparatorComponent: FC = () => {
+	return (
+		<View style={styles.serviceListSeparator} collapsable={false} />
 	);
 };
 
@@ -760,6 +844,17 @@ const styles = StyleSheet.create({
 		height: 1,
 		backgroundColor: '#000000',
 	},
+	serviceListItem: {
+		fontSize: 22,
+		padding: 20,
+	},
+	serviceListItemPressed: {
+		backgroundColor: '#2196f3',
+	},
+	serviceListSeparator: {
+		height: 1,
+		backgroundColor: '#000000',
+	},
 	bipPhrase: {
 		flexGrow: 1,
 	},
@@ -838,6 +933,12 @@ const styles = StyleSheet.create({
 		fontSize: 15,
 		padding: 5,
 	},
+	floatingLoader: {
+		position: 'absolute',
+		left: 0,
+		right: 0,
+		zIndex: 1,
+	}
 });
 
 export default App;

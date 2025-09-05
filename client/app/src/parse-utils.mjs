@@ -4,6 +4,7 @@ import {
 } from './weak-event.mjs'
 
 const kSignalListener = Symbol('kSignalListener')
+const kRefHolder = Symbol('kRefHolder')
 
 export function combineStreams(...streams) {
 	return async function* (source, { signal } = {}) {
@@ -96,7 +97,7 @@ export function readerFromNodeStream(stream) {
 
 		sigError.signal.addEventListener('abort', () => controller.abort(sigError.signal.reason));
 
-		return (async function* () {
+		const ret = (async function* () {
 			try {
 				// The input doesn't matter. Discard it
 				source && await source({ signal: AbortSignal.abort() }).return();
@@ -120,10 +121,11 @@ export function readerFromNodeStream(stream) {
 				controller.abort(e);
 				throw e;
 			}
-			finally {
-				stream.destroy();
-			}
 		})();
+
+		ret[kRefHolder] = [sigReadable, sigError, sigClose, stream, controller];
+
+		return ret;
 	};
 }
 
@@ -147,7 +149,6 @@ export function writerFromNodeStream(stream) {
 		controller.signal.addEventListener('abort', () => stream.destroy(controller.signal.reason));
 
 		const sigDrain = new EventSignal(stream, 'drain');
-		const sigFinish = new EventSignal(stream, 'finish');
 		const sigError = new EventSignal(stream, 'error');
 		const sigClose = new EventSignal(stream, 'close');
 
@@ -168,7 +169,7 @@ export function writerFromNodeStream(stream) {
 				}
 			}
 			stream.end();
-			await EventSignal.wait(AbortSignal.any([sigFinish.signal, sigClose.signal, controller.signal]));
+			await EventSignal.wait(AbortSignal.any([sigClose.signal, controller.signal]));
 			// No need to throw on controller abort here. It would just translate back to the controller
 		})().catch((error) => {
 			controller.abort(error);
@@ -176,10 +177,14 @@ export function writerFromNodeStream(stream) {
 			controllerFinal.abort();
 		});
 
-		return (async function* () {
+		const ret = (async function* () {
 			await EventSignal.wait(controllerFinal.signal);
 			controller.signal.throwIfAborted();
 		})();
+
+		ret[kRefHolder] = [sigDrain, sigError, sigClose, stream, controller];
+
+		return ret;
 	};
 }
 
@@ -437,9 +442,7 @@ export class StreamSplitter {
 		const onStream = this.#onStream || async function* () {
 		};
 
-		return async function* (stream, options) {
-			const { signal } = options || {};
-
+		return async function* (stream, { signal } = {}) {
 			if (signal) {
 				if (signal.aborted) {
 					throw signal.reason;
@@ -452,10 +455,7 @@ export class StreamSplitter {
 
 			(async () => {
 				for await (const packeter of streamPacketer(stream({ signal: controller.signal }))) {
-					while (true) {
-						if (!await anyPacket(packeter)) {
-							return;
-						}
+					while (await anyPacket(packeter)) {
 						const type = await consumeUInt32LE(packeter);
 						switch (type) {
 							case MSG_REMOTE_NEW: {
