@@ -82,10 +82,16 @@ async function daemon() {
 		};
 	}
 
-	const server = node.createServer();
+	const server = node.createServer({
+		firewall: (remotePublicKey) => {
+			const row = db.prepare(`SELECT 1 FROM remotes WHERE publicKey = $publicKey`).get({
+				$publicKey: remotePublicKey,
+			});
+			return !row;
+		}
+	});
 
 	server.on('connection', (socket) => {
-		console.log('Connection from socket', entropyToMnemonic(socket.remotePublicKey, wordlist));
 		runStream(combineStreams(
 			readerFromNodeStream(socket),
 			async function* (source, { signal } = {}) {

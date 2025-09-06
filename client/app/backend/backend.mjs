@@ -56,6 +56,9 @@ const splitter = new StreamSplitter(async function* (stream, { signal } = {}) {
 					// Read the results
 					yield* readerFromNodeStream(socket)(null, { signal: signal ? AbortSignal.any([ signal, controller.signal ]) : controller.signal });
 				}
+				catch (e) {
+					console.log(e);
+				}
 				finally {
 					socket.destroy();
 				}
