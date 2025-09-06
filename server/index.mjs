@@ -62,6 +62,7 @@ async function daemon() {
 	)`);
 	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS services__port ON services (port)`);
 	db.exec(`CREATE INDEX IF NOT EXISTS services__name ON services (LENGTH(name), name)`);
+	db.exec(`CREATE INDEX IF NOT EXISTS services__name_nolen ON services (name)`);
 
 	const node = new DHT();
 
@@ -91,11 +92,11 @@ async function daemon() {
 				for await (const packeter of streamPacketer(source({ signal }))) {
 					switch (await consumeUInt32LE(packeter)) {
 						case RPC_LIST: {
-							for (const name of ['Placeholder', 'Dummy', 'Foobar']) {
-								const service = Buffer.from(name);
-								yield packetUInt32LE(service.byteLength);
-								yield service;
+							for (const row of db.prepare(`SELECT name FROM services ORDER BY name ASC`).iterate()) {
+								yield packetUInt32LE(row.name.byteLength);
+								yield row.name;
 							}
+							break;
 						}
 					}
 				}
