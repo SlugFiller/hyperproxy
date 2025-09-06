@@ -21,6 +21,7 @@ import {
 	fileURLToPath,
 } from 'node:url';
 import {
+	anyPacket,
 	combineStreams,
 	consumeBuffer,
 	consumeUInt32LE,
@@ -51,6 +52,16 @@ async function daemon() {
 		publicKey BLOB,
 		secretKey BLOB
 	)`);
+	db.exec(`CREATE TABLE IF NOT EXISTS remotes(
+		publicKey BLOB
+	)`);
+	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS remotes__pubkey ON remotes (publicKey)`);
+	db.exec(`CREATE TABLE IF NOT EXISTS services(
+		port INTEGER,
+		name BLOB
+	)`);
+	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS services__port ON services (port)`);
+	db.exec(`CREATE INDEX IF NOT EXISTS services__name ON services (LENGTH(name), name)`);
 
 	const node = new DHT();
 
@@ -111,6 +122,52 @@ async function daemon() {
 						case CMD_SHOW_KEY: {
 							yield packetUInt32LE(keyPair.publicKey.byteLength);
 							yield keyPair.publicKey;
+							break;
+						}
+						case CMD_SHOW_SERVICES: {
+							for (const row of db.prepare(`SELECT port, name FROM services ORDER BY port ASC`).iterate()) {
+								yield packetUInt32LE(row.port);
+								yield packetUInt32LE(row.name.byteLength);
+								yield row.name;
+							}
+							break;
+						}
+						case CMD_SHOW_REMOTES: {
+							for (const row of db.prepare(`SELECT publicKey FROM remotes ORDER BY publicKey ASC`).iterate()) {
+								yield packetUInt32LE(row.publicKey.byteLength);
+								yield row.publicKey;
+							}
+							break;
+						}
+						case CMD_ADD_SERVICE: {
+							const port = await consumeUInt32LE(packeter);
+							const name = await consumeBuffer(packeter);
+							db.prepare(`REPLACE INTO services(port, name) VALUES ($port, $name)`).run({
+								$port: port,
+								$name: name,
+							});
+							break;
+						}
+						case CMD_REMOVE_SERVICE: {
+							const port = await consumeUInt32LE(packeter);
+							db.prepare(`DELETE FROM services WHERE port = $port`).run({
+								$port: port,
+							});
+							break;
+						}
+						case CMD_ADD_REMOTE: {
+							const publicKey = await consumeBuffer(packeter);
+							db.prepare(`INSERT OR IGNORE INTO remotes(publicKey) VALUES ($publicKey)`).run({
+								$publicKey: publicKey,
+							});
+							break;
+						}
+						case CMD_REMOVE_REMOTE: {
+							const publicKey = await consumeBuffer(packeter);
+							db.prepare(`DELETE FROM remotes WHERE publicKey = $publicKey`).run({
+								$publicKey: publicKey,
+							});
+							break;
 						}
 					}
 				}
@@ -130,7 +187,7 @@ async function runCommand(writer, reader) {
 	const socket = createConnection(CMD_PATH);
 	const controller = new AbortController();
 	try {
-		runStream(combineStreams(
+		const writeTask = runStream(combineStreams(
 			writer,
 			writerFromNodeStream(socket)
 		)).catch((error) => {
@@ -139,6 +196,7 @@ async function runCommand(writer, reader) {
 		for await (const packeter of streamPacketer(readerFromNodeStream(socket)(null, { signal: controller.signal }))) {
 			await reader(packeter);
 		}
+		await writeTask;
 	}
 	finally {
 		socket.destroy();
@@ -174,6 +232,135 @@ async function app() {
 			yield packetUInt32LE(CMD_SHOW_KEY);
 		}, async(packeter) => {
 			printKey(await consumeBuffer(packeter));
+		});
+	}
+
+	if (argv[2] === 'show' && argv[3] === 'services') {
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_SHOW_SERVICES);
+		}, async(packeter) => {
+			while (await anyPacket(packeter)) {
+				const port = await consumeUInt32LE(packeter);
+				const name = (await consumeBuffer(packeter)).toString();
+				console.log(`${ port.toString().padStart(8) } ${name}`);
+			}
+		});
+	}
+
+	if (argv[2] === 'show' && argv[3] === 'allowed') {
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_SHOW_REMOTES);
+		}, async(packeter) => {
+			if (await anyPacket(packeter)) {
+				printKey(await consumeBuffer(packeter));
+			}
+			while (await anyPacket(packeter)) {
+				console.log();
+				printKey(await consumeBuffer(packeter));
+			}
+		});
+	}
+
+	if (argv[2] === 'add') {
+		if (!/^[0-9]+$/.test(argv[3])) {
+			console.log('Please specify a port');
+			console.log();
+			console.log('Usage:');
+			console.log('  add <port> <name>');
+			return;
+		}
+		const name = argv.slice(4).join(' ').trim();
+		if (name === '') {
+			console.log('Please specify a name');
+			console.log();
+			console.log('Usage:');
+			console.log('  add <port> <name>');
+			return;
+		}
+		const port = parseInt(argv[3]);
+		const nameBuf = Buffer.from(name);
+		if (port < 1 || port > 65535) {
+			console.log('Port must be between 1 and 65535');
+			return;
+		}
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_ADD_SERVICE);
+			yield packetUInt32LE(port);
+			yield packetUInt32LE(nameBuf.byteLength);
+			yield nameBuf;
+		}, async() => {
+		});
+	}
+
+	if (argv[2] === 'remove') {
+		if (!/^[0-9]+$/.test(argv[3])) {
+			console.log('Please specify a port');
+			console.log();
+			console.log('Usage:');
+			console.log('  add <port> <name>');
+			return;
+		}
+		const port = parseInt(argv[3]);
+		if (port < 1 || port > 65535) {
+			console.log('Port must be between 1 and 65535');
+			return;
+		}
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_REMOVE_SERVICE);
+			yield packetUInt32LE(port);
+		}, async() => {
+		});
+	}
+
+	if (argv[2] === 'allow') {
+		const pubkey_phrase = argv.slice(3).join(' ').trim();
+		if (pubkey_phrase === '') {
+			console.log('Please specify a public key as a BIP39 mnemonic phrase');
+			console.log();
+			console.log('Usage:');
+			console.log('  allow <public key>');
+			return;
+		}
+		let pubkey;
+		try {
+			pubkey = mnemonicToEntropy(pubkey_phrase, wordlist);
+		}
+		catch (e) {
+			console.log('Not a valid BIP39 phrase:');
+			console.log(pubkey_phrase);
+			console.log(e.message);
+		}
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_ADD_REMOTE);
+			yield packetUInt32LE(pubkey.byteLength);
+			yield pubkey;
+		}, async() => {
+		});
+	}
+
+	if (argv[2] === 'deny') {
+		const pubkey_phrase = argv.slice(3).join(' ').trim();
+		if (pubkey_phrase === '') {
+			console.log('Please specify a public key as a BIP39 mnemonic phrase');
+			console.log();
+			console.log('Usage:');
+			console.log('  allow <public key>');
+			return;
+		}
+		let pubkey;
+		try {
+			pubkey = mnemonicToEntropy(pubkey_phrase, wordlist);
+		}
+		catch (e) {
+			console.log('Not a valid BIP39 phrase:');
+			console.log(pubkey_phrase);
+			console.log(e.message);
+		}
+		return await runCommand(async function* () {
+			yield packetUInt32LE(CMD_REMOVE_REMOTE);
+			yield packetUInt32LE(pubkey.byteLength);
+			yield pubkey;
+		}, async() => {
 		});
 	}
 
