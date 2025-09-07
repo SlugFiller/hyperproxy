@@ -45,9 +45,6 @@ import type {
 	ViewStyle,
 } from 'react-native';
 import {
-	Worklet,
-} from 'react-native-bare-kit';
-import {
 	enableSimpleNullHandling,
 	open,
 } from 'react-native-nitro-sqlite';
@@ -63,6 +60,9 @@ import ToastManager, {
 	Toast,
 } from 'toastify-react-native'
 import {
+	useForegroundWorklet,
+} from './foreground-worklet.ts'
+import {
 	StreamSplitter,
 	anyPacket,
 	combineStreams,
@@ -73,11 +73,14 @@ import {
 	streamPacketer,
 	writerFromNodeStream,
 } from './parse-utils.mjs'
-import backendBundle from '../backend.bundle.mjs'
 import {
 	RPC_KEYGEN,
 	RPC_LIST,
 } from '../backend/rpc-commands.mjs';
+
+interface AbortSignalStatic {
+	any(signals: Iterable<AbortSignal>): AbortSignal;
+}
 
 enableSimpleNullHandling();
 
@@ -157,36 +160,38 @@ const AppContent: FC = () => {
 	const [keyPair, setKeyPair] = useState<KeyPairStatus>({ status: 'loading' });
 	const [selectedView, setSelectedView] = useState<SelectedView>({ view: 'list' });
 
-	let phraseDecoded: null | Uint8Array = null;
+	let phraseDecodable: boolean = false;
 	try {
-		phraseDecoded = mnemonicToEntropy(phrase, wordlist);
+		mnemonicToEntropy(phrase, wordlist);
+		phraseDecodable = true;
 	}
 	catch {
 	}
 
-	const worklet = useMemo(() => {
-		return new Worklet();
-	}, []);
+	const IPC = useForegroundWorklet();
 
 	const splitter = useMemo(() => {
 		return new StreamSplitter();
 	}, []);
 
 	useEffect(() => {
-		worklet.start('/backend.bundle', backendBundle);
+		if (!IPC) {
+			return;
+		}
 
 		const controller = new AbortController();
 		runStream(combineStreams(
-			readerFromNodeStream(worklet.IPC),
+			readerFromNodeStream(IPC),
 			splitter.split,
-			writerFromNodeStream(worklet.IPC)
+			writerFromNodeStream(IPC)
 		), { signal: controller.signal }).catch(() => {
 			// If we're here, it's most likely due to abort. Ignore
 		});
+
 		return () => {
 			controller.abort();
 		};
-	}, [worklet, splitter]);
+	}, [IPC, splitter]);
 
 	useEffect(() => {
 		const controller = new AbortController();
@@ -210,7 +215,7 @@ const AppContent: FC = () => {
 			const newKeyPair = await new Promise<KeyPair>((resolve) => {
 				splitter.createStream(async function* (stream, { signal } = {}) {
 					yield packetUInt32LE(RPC_KEYGEN);
-					for await (const packeter of streamPacketer(stream({ signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }))) {
+					for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
 						const publicKey = await consumeBuffer(packeter);
 						const secretKey = await consumeBuffer(packeter);
 						resolve({
@@ -377,7 +382,7 @@ const AppContent: FC = () => {
 							case 'add': return (
 								<TextButton
 									title="Add"
-									disabled={serverName === '' || phraseDecoded === null}
+									disabled={serverName === '' || phraseDecodable}
 									onPress={addServer}
 									style={styles.button}
 									stylePressed={styles.buttonPressed}
@@ -390,7 +395,7 @@ const AppContent: FC = () => {
 							case 'edit': return (
 								<TextButton
 									title="Save"
-									disabled={serverName === '' || phraseDecoded === null}
+									disabled={serverName === '' || phraseDecodable}
 									onPress={() => editServer(selectedView.name)}
 									style={styles.button}
 									stylePressed={styles.buttonPressed}
@@ -568,7 +573,7 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, streamSplitter:
 			yield keyPair.secretKey;
 			yield packetUInt32LE(serverKey.byteLength);
 			yield serverKey;
-			for await (const packeter of streamPacketer(stream({ signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }))) {
+			for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
 				while (await anyPacket(packeter)) {
 					const service = b4a.toString(await consumeBuffer(packeter));
 					gotServices.push(service);

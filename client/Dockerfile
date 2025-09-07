@@ -41,6 +41,8 @@ COPY ./app/android /usr/src/app/android/
 
 COPY ./app/index.js /usr/src/app/
 
+COPY ./app/specs /usr/src/app/specs
+
 WORKDIR /usr/src/app/android
 
 RUN ./gradlew --build-cache --no-daemon assembleDebug
@@ -76,6 +78,8 @@ COPY ./app/android/app/build.gradle ./app/android/app/release.keystore ./app/and
 RUN ./gradlew --build-cache --no-daemon
 
 COPY ./app/android/app/src/main/AndroidManifest.xml /usr/src/app/android/app/src/main/AndroidManifest.xml
+
+COPY ./app/specs /usr/src/app/specs
 
 RUN ./gradlew --build-cache --no-daemon :app:mergeReleaseNativeLibs
 
