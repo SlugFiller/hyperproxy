@@ -425,7 +425,7 @@ export class StreamSplitter {
 				substreamsLocal[stream_id] = substream;
 			}
 			else {
-				const stream_id = substreamsLocal.length;
+				stream_id = substreamsLocal.length;
 				substreamsLocal.push(substream);
 			}
 			// Inform remote we have a new stream

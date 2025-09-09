@@ -21,6 +21,7 @@ import {
 	fileURLToPath,
 } from 'node:url';
 import {
+	StreamSplitter,
 	anyPacket,
 	combineStreams,
 	consumeBuffer,
@@ -140,23 +141,28 @@ async function daemon() {
 									break;
 								}
 							}
-							const socket = createConnection(port, 'localhost');
-							const controller = new AbortController();
-							try {
-								const writeTask = runStream(combineStreams(
-									async function* () {
-										yield* packeter.rest();
-									},
-									writerFromNodeStream(socket)
-								)).catch((error) => {
-									controller.abort(error);
-								});
-								yield* readerFromNodeStream(socket)(null, { signal: controller.signal });
-								await writeTask;
-							}
-							finally {
-								socket.destroy();
-							}
+							const splitter = new StreamSplitter(async function* (source, { signal } = {}) {
+								const controller = new AbortController();
+								const proxied = createConnection(port, 'localhost');
+								try {
+									const writeTask = runStream(combineStreams(
+										async function* () {
+											yield* source({ signal });
+										},
+										writerFromNodeStream(proxied)
+									)).catch((error) => {
+										controller.abort(error);
+									});
+									yield* readerFromNodeStream(proxied)(null, { signal: controller.signal });
+									await writeTask;
+								}
+								finally {
+									proxied.destroy();
+								}
+							});
+							yield* splitter.split(async function* () {
+								yield* packeter.rest();
+							}, { signal });
 							break;
 						}
 					}

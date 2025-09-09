@@ -6,7 +6,12 @@ import {
 	RPC_PROXY,
 } from './rpc-commands.mjs';
 import {
+	StreamSplitter,
+	combineStreams,
 	packetUInt32LE,
+	readerFromNodeStream,
+	runStream,
+	writerFromNodeStream,
 } from '../src/parse-utils.mjs';
 
 const activeProxies = new Map();
@@ -24,7 +29,7 @@ export async function addOrGetProxy(node, keyPair, serverKey, serviceName) {
 	}
 	const created = await createProxy(node, keyPair, serverKey, serviceName);
 	services.set(service64, created);
-	return created.address().port;
+	return created[0].address().port;
 }
 
 export function getProxy(serverKey, serviceName) {
@@ -38,7 +43,7 @@ export function getProxy(serverKey, serviceName) {
 	if (!proxy) {
 		return 0;
 	}
-	return proxy.address().port;
+	return proxy[0].address().port;
 }
 
 export function removeProxy(serverKey, serviceName) {
@@ -52,7 +57,8 @@ export function removeProxy(serverKey, serviceName) {
 	if (!proxy) {
 		return;
 	}
-	proxy.close();
+	proxy[0].close();
+	proxy[1].destroy();
 	services.delete(service64);
 	if (services.size < 1) {
 		activeProxies.delete(server64)
@@ -66,30 +72,44 @@ export function removeAllProxies(serverKey) {
 		return;
 	}
 	for (const proxy of services.values()) {
-		proxy.close();
+		proxy[0].close();
+		proxy[1].destroy();
 	}
 	activeProxies.delete(server64)
 }
 
 async function createProxy(node, keyPair, serverKey, serviceName) {
 	const server = createServer();
+	const remote = node.connect(serverKey, { keyPair });
+	// These writes can be done "blind" because streamx will queue and deliver them
+	remote.write(packetUInt32LE(RPC_PROXY));
+	remote.write(packetUInt32LE(serviceName.byteLength));
+	remote.write(serviceName);
+	const splitter = new StreamSplitter();
+	runStream(combineStreams(
+		readerFromNodeStream(remote),
+		splitter.split,
+		writerFromNodeStream(remote)
+	)).catch(() => {
+		removeProxy(serverKey, serviceName);
+	});
 	server.on('connection', (socket) => {
-		const remote = node.connect(serverKey, { keyPair });
-		// These writes can be done "blind" because streamx will queue and deliver them
-		remote.write(packetUInt32LE(RPC_PROXY));
-		remote.write(packetUInt32LE(serviceName.byteLength));
-		remote.write(serviceName);
-		// Now plumb them together
-		// Log errors, but don't do anything about them
-		// That's between the server and the connecting application. This app only proxies
-		remote.pipe(socket, (err) => {
-			if (err) {
-				console.log(err);
+		splitter.createStream(async function* (source, { signal } = {}) {
+			const controller = new AbortController();
+			try {
+				const writeTask = runStream(combineStreams(
+					async function* () {
+						yield* source({ signal });
+					},
+					writerFromNodeStream(socket)
+				)).catch((error) => {
+					controller.abort(error);
+				});
+				yield* readerFromNodeStream(socket)(null, { signal: controller.signal });
+				await writeTask;
 			}
-		});
-		socket.pipe(remote, (err) => {
-			if (err) {
-				console.log(err);
+			finally {
+				socket.destroy();
 			}
 		});
 	});
@@ -97,5 +117,5 @@ async function createProxy(node, keyPair, serverKey, serviceName) {
 	await new Promise((resolve) => {
 		server.listen('127.0.0.1', resolve);
 	});
-	return server;
+	return [server, remote];
 }
