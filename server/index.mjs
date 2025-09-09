@@ -33,6 +33,7 @@ import {
 } from './parse-utils.mjs';
 import {
 	RPC_LIST,
+	RPC_PROXY,
 } from './rpc-commands.mjs';
 
 const CMD_SHOW_KEY = 0;
@@ -101,6 +102,60 @@ async function daemon() {
 							for (const row of db.prepare(`SELECT name FROM services ORDER BY name ASC`).iterate()) {
 								yield packetUInt32LE(row.name.byteLength);
 								yield row.name;
+							}
+							break;
+						}
+						case RPC_PROXY: {
+							const length = await consumeUInt32LE(packeter);
+							if (!db.prepare(`SELECT 1 FROM services WHERE LENGTH(name) = $length LIMIT 1`).get({
+								$length: length,
+							})) {
+								return;
+							}
+							let port = 0;
+							for await (const packet of packeter) {
+								if (packet.byteLength < length) {
+									if (packet.byteLength > 0) {
+										const prefixPlus = Buffer.from(packet);
+										prefixPlus[prefixPlus.byteLength - 1]++;
+										if (!db.prepare(`SELECT 1 FROM services WHERE LENGTH(name) = $length AND name >= $prefix AND name < $prefixPlus LIMIT 1`).get({
+											$length: length,
+											$prefix: packet,
+											$prefixPlus: prefixPlus,
+										})) {
+											return;
+										}
+									}
+								}
+								else {
+									const row = db.prepare(`SELECT port FROM services WHERE LENGTH(name) = $length AND name = $match LIMIT 1`).get({
+										$length: length,
+										$match: packet.subarray(0, length),
+									});
+									if (!row) {
+										return;
+									}
+									packeter.consume(length);
+									port = row.port;
+									break;
+								}
+							}
+							const socket = createConnection(port, 'localhost');
+							const controller = new AbortController();
+							try {
+								const writeTask = runStream(combineStreams(
+									async function* () {
+										yield* packeter.rest();
+									},
+									writerFromNodeStream(socket)
+								)).catch((error) => {
+									controller.abort(error);
+								});
+								yield* readerFromNodeStream(socket)(null, { signal: controller.signal });
+								await writeTask;
+							}
+							finally {
+								socket.destroy();
 							}
 							break;
 						}
@@ -208,7 +263,6 @@ async function runCommand(writer, reader) {
 	finally {
 		socket.destroy();
 	}
-
 }
 
 function printKey(publicKey) {

@@ -18,6 +18,16 @@ module.exports = {
           ecmaVersion: "latest",
           sourceType: "module",
       },
+      "rules": {
+        "@typescript-eslint/no-unused-vars": [
+          'error',
+          {
+            argsIgnorePattern: '^_',
+            destructuredArrayIgnorePattern: '^_',
+            varsIgnorePattern: "^_",
+          },
+        ],
+      },
     },
   ],
 };

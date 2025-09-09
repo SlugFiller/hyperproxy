@@ -220,6 +220,21 @@ export async function* streamPacketer(stream) {
 				}
 				return Promise.resolve({ done: true, value: undefined });
 			},
+			async * rest() {
+				const first = buffer;
+				buffer = Buffer.alloc(0);
+				returnSame = false;
+				if (first.byteLength > 0) {
+					yield first;
+				}
+				while (true) {
+					const { done, value } = await iter.next();
+					if (done) {
+						return value;
+					}
+					yield value;
+				}
+			},
 			[Symbol.asyncIterator]() {
 				return this;
 			},

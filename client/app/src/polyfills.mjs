@@ -223,7 +223,7 @@ if (typeof global.AbortSignal === 'undefined' || typeof global.AbortSignal.abort
 				}
 				if (signal.aborted) {
 					controller.abort(signal.reason);
-					return;
+					return controller.signal;
 				}
 				const object = {
 					ref1: {},

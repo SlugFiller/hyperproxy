@@ -20,6 +20,7 @@
   "dependencies": {
     "@scure/bip39": "latest",
     "b4a": "latest",
+    "bare-tcp": "latest",
     "events": "latest",
     "react": "19.1.0",
     "react-native": "0.81.0",

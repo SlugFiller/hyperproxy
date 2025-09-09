@@ -3,8 +3,18 @@
 import '../src/polyfills.mjs';
 import DHT from 'hyperdht';
 import {
+	addOrGetProxy,
+	getProxy,
+	removeProxy,
+	removeAllProxies,
+} from './proxy-manager.mjs';
+import {
 	RPC_KEYGEN,
 	RPC_LIST,
+	RPC_PROXY,
+	RPC_UNPROXY,
+	RPC_IS_PROXY,
+	RPC_UNPROXY_ALL,
 } from './rpc-commands.mjs';
 import {
 	StreamSplitter,
@@ -62,6 +72,35 @@ const splitter = new StreamSplitter(async function* (stream, { signal } = {}) {
 				finally {
 					socket.destroy();
 				}
+				break;
+			}
+			case RPC_PROXY: {
+				const publicKey = await consumeBuffer(packeter);
+				const secretKey = await consumeBuffer(packeter);
+				const serverKey = await consumeBuffer(packeter);
+				const serviceName = await consumeBuffer(packeter);
+				yield packetUInt32LE(await addOrGetProxy(node, {
+					publicKey,
+					secretKey,
+				}, serverKey, serviceName));
+				break;
+			}
+			case RPC_UNPROXY: {
+				const serverKey = await consumeBuffer(packeter);
+				const serviceName = await consumeBuffer(packeter);
+				removeProxy(serverKey, serviceName);
+				break;
+			}
+			case RPC_IS_PROXY: {
+				const serverKey = await consumeBuffer(packeter);
+				const serviceName = await consumeBuffer(packeter);
+				yield packetUInt32LE(getProxy(serverKey, serviceName));
+				break;
+			}
+			case RPC_UNPROXY_ALL: {
+				const serverKey = await consumeBuffer(packeter);
+				removeAllProxies(serverKey);
+				break;
 			}
 		}
 	}

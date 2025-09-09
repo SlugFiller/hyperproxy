@@ -1,6 +1,7 @@
 {
 	"dependencies": {
 		"b4a": "latest",
+		"bare-tcp": "latest",
 		"hyperdht": "latest"
 	}
 }

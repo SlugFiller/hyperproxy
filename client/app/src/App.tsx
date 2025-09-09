@@ -30,6 +30,7 @@ import type {
 import {
 	ActivityIndicator,
 	FlatList,
+	Linking,
 	Pressable,
 	StatusBar,
 	StyleSheet,
@@ -67,6 +68,7 @@ import {
 	anyPacket,
 	combineStreams,
 	consumeBuffer,
+	consumeUInt32LE,
 	packetUInt32LE,
 	readerFromNodeStream,
 	runStream,
@@ -76,6 +78,10 @@ import {
 import {
 	RPC_KEYGEN,
 	RPC_LIST,
+	RPC_PROXY,
+	RPC_UNPROXY,
+	RPC_IS_PROXY,
+	RPC_UNPROXY_ALL,
 } from '../backend/rpc-commands.mjs';
 
 interface AbortSignalStatic {
@@ -144,6 +150,12 @@ const AppContent: FC = () => {
 			view: 'show',
 			name: string,
 			key: Uint8Array<ArrayBuffer>,
+		}
+		| {
+			view: 'service',
+			name: string,
+			key: Uint8Array<ArrayBuffer>,
+			service: string,
 		}
 		| {
 			view: 'add',
@@ -263,6 +275,15 @@ const AppContent: FC = () => {
 		});
 	}, [setSelectedView]);
 
+	const selectService = useCallback((service: string) => {
+		setSelectedView((selected) => selected.view !== 'show' ? selected : {
+			view: 'service',
+			name: selected.name,
+			key: selected.key,
+			service,
+		});
+	}, [setSelectedView]);
+
 	const addServer = useCallback(() => {
 		try {
 			if (serverName === '') {
@@ -298,6 +319,33 @@ const AppContent: FC = () => {
 		}
 	}, [serverName, phrase, setServerListReload, setSelectedView]);
 
+	const deleteServer = useCallback((name: string) => {
+		try {
+			if (serverName === '') {
+				throw new Error('Server name empty');
+			}
+			const { rows } = db.execute<{ publicKey: ArrayBuffer }>(`SELECT publicKey FROM server WHERE name = ?`, [name]);
+			if (!rows || rows.length < 1) {
+				throw new Error('Server not found');
+			}
+			const serverKey = new Uint8Array(rows.item(0)!.publicKey);
+			db.execute(`DELETE FROM server WHERE name = ?`, [name]);
+			splitter.createStream(async function* (stream, { signal } = {}) {
+				yield packetUInt32LE(RPC_UNPROXY_ALL);
+				yield packetUInt32LE(serverKey.byteLength);
+				yield serverKey;
+				for await (const _discard of stream({ signal }));
+				setServerListReload({});
+				setSelectedView({
+					view: 'list',
+				});
+			});
+		}
+		catch (error) {
+			error instanceof Error && Toast.error(error.message);
+		}
+	}, [serverName, setServerListReload, setSelectedView, splitter]);
+
 	const moveToEdit = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
 		setServerName(name);
 		setPhrase(entropyToMnemonic(key, wordlist));
@@ -323,7 +371,28 @@ const AppContent: FC = () => {
 								<Text style={styles.serverNameLabel}>Server name:</Text>
 								<Text style={styles.serverNameText}>{selectedView.name}</Text>
 							</View>
-							<ServiceList keyPair={keyPair} serverKey={selectedView.key} streamSplitter={splitter} />
+							<ServiceList
+								keyPair={keyPair}
+								serverKey={selectedView.key}
+								streamSplitter={splitter}
+								onSelect={selectService}
+							/>
+						</>)
+						case 'service': return (<>
+							<View style={styles.editNameContainer}>
+								<Text style={styles.serverNameLabel}>Server name:</Text>
+								<Text style={styles.serverNameText}>{selectedView.name}</Text>
+							</View>
+							<View style={styles.editNameContainer}>
+								<Text style={styles.serverNameLabel}>Service name:</Text>
+								<Text style={styles.serverNameText}>{selectedView.service}</Text>
+							</View>
+							<ServiceProxy
+								keyPair={keyPair}
+								serverKey={selectedView.key}
+								serviceName={selectedView.service}
+								streamSplitter={splitter}
+							/>
 						</>)
 						case 'add':
 						case 'edit': return (<>
@@ -362,7 +431,7 @@ const AppContent: FC = () => {
 					</>) : (<>
 						<TextButton
 							title="Back"
-							onPress={() => setSelectedView({ view: 'list' })}
+							onPress={() => setSelectedView((selected) => selected.view !== 'service' ? { view: 'list' } : { view: 'show', name: selected.name, key: selected.key })}
 							style={styles.button}
 							stylePressed={styles.buttonPressed}
 							styleText={styles.buttonText}
@@ -382,7 +451,7 @@ const AppContent: FC = () => {
 							case 'add': return (
 								<TextButton
 									title="Add"
-									disabled={serverName === '' || phraseDecodable}
+									disabled={serverName === '' || !phraseDecodable}
 									onPress={addServer}
 									style={styles.button}
 									stylePressed={styles.buttonPressed}
@@ -392,10 +461,18 @@ const AppContent: FC = () => {
 									styleDisabledText={styles.buttonDisabledText}
 								/>
 							)
-							case 'edit': return (
+							case 'edit': return (<>
+								<TextButton
+									title="Delete"
+									onPress={() => deleteServer(selectedView.name)}
+									style={styles.button}
+									stylePressed={styles.buttonPressed}
+									styleText={styles.buttonText}
+									stylePressedText={styles.buttonPressedText}
+								/>
 								<TextButton
 									title="Save"
-									disabled={serverName === '' || phraseDecodable}
+									disabled={serverName === '' || !phraseDecodable}
 									onPress={() => editServer(selectedView.name)}
 									style={styles.button}
 									stylePressed={styles.buttonPressed}
@@ -404,7 +481,7 @@ const AppContent: FC = () => {
 									stylePressedText={styles.buttonPressedText}
 									styleDisabledText={styles.buttonDisabledText}
 								/>
-							)
+							</>)
 						} })()}
 					</>)}
 				</View>
@@ -619,6 +696,159 @@ const ServiceListSeparatorComponent: FC = () => {
 	return (
 		<View style={styles.serviceListSeparator} collapsable={false} />
 	);
+};
+
+interface ServiceProxyProps {
+	keyPair: KeyPairStatus;
+	serverKey: Uint8Array<ArrayBuffer>;
+	serviceName: string;
+	streamSplitter: StreamSplitter;
+}
+
+const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, streamSplitter: splitter }) => {
+	type ProxyStatus =
+		| {
+			status: 'loading',
+		}
+		| {
+			status: 'error',
+			error: Error,
+		}
+		| {
+			status: 'available',
+		}
+		| {
+			status: 'active',
+			port: number,
+		}
+	;
+
+	const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ status: 'loading' });
+
+	useEffect(() => {
+		const controller = new AbortController();
+
+		splitter.createStream(async function* (stream, { signal } = {}) {
+			yield packetUInt32LE(RPC_IS_PROXY);
+			yield packetUInt32LE(serverKey.byteLength);
+			yield serverKey;
+			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
+			yield packetUInt32LE(serviceBuf.byteLength);
+			yield serviceBuf;
+			for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
+				const port = await consumeUInt32LE(packeter);
+				if (port > 0) {
+					setProxyStatus({
+						status: 'active',
+						port,
+					});
+				}
+				else {
+					setProxyStatus({
+						status: 'available',
+					});
+				}
+			}
+		});
+
+		return () => {
+			controller.abort();
+		};
+	}, [serverKey, serviceName, splitter, setProxyStatus]);
+
+	const startProxy = useCallback(() => {
+		if (keyPair.status !== 'valid') {
+			return;
+		}
+
+		splitter.createStream(async function* (stream, { signal } = {}) {
+			yield packetUInt32LE(RPC_PROXY);
+			yield packetUInt32LE(keyPair.publicKey.byteLength);
+			yield keyPair.publicKey;
+			yield packetUInt32LE(keyPair.secretKey.byteLength);
+			yield keyPair.secretKey;
+			yield packetUInt32LE(serverKey.byteLength);
+			yield serverKey;
+			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
+			yield packetUInt32LE(serviceBuf.byteLength);
+			yield serviceBuf;
+			for await (const packeter of streamPacketer(stream({ signal }))) {
+				const port = await consumeUInt32LE(packeter);
+				if (port > 0) {
+					setProxyStatus({
+						status: 'active',
+						port,
+					});
+				}
+			}
+		});
+	}, [keyPair, serverKey, serviceName, splitter]);
+
+	const stopProxy = useCallback(() => {
+		splitter.createStream(async function* (stream, { signal } = {}) {
+			yield packetUInt32LE(RPC_UNPROXY);
+			yield packetUInt32LE(serverKey.byteLength);
+			yield serverKey;
+			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
+			yield packetUInt32LE(serviceBuf.byteLength);
+			yield serviceBuf;
+			for await (const _discard of stream({ signal }));
+			setProxyStatus({
+				status: 'available',
+			});
+		});
+	}, [serverKey, serviceName, splitter]);
+
+	const startBrowser = useCallback(() => {
+		if (proxyStatus.status !== 'active') {
+			return;
+		}
+
+		Linking.openURL(`http://localhost:${ proxyStatus.port }`).catch((error: Error) => {
+			Toast.error(error.message);
+		});
+	}, [proxyStatus]);
+
+	switch (proxyStatus.status) {
+		case 'loading': return (
+			<ActivityIndicator size="large" />
+		);
+		case 'error': return (
+			<View>
+				<Text>Error</Text>
+				<Text>{proxyStatus.error.message}</Text>
+				<Text>{proxyStatus.error.stack}</Text>
+			</View>
+		);
+		case 'available': return (
+			<TextButton
+				title="Proxy"
+				onPress={startProxy}
+				style={styles.centerButton}
+				stylePressed={styles.centerButtonPressed}
+				styleText={styles.buttonText}
+				stylePressedText={styles.buttonPressedText}
+			/>
+		);
+		case 'active': return (<>
+			<TextButton
+				title="Stop"
+				onPress={stopProxy}
+				style={styles.centerButton}
+				stylePressed={styles.centerButtonPressed}
+				styleText={styles.buttonText}
+				stylePressedText={styles.buttonPressedText}
+			/>
+			<TextButton
+				title="Launch browser"
+				onPress={startBrowser}
+				style={styles.centerButton}
+				stylePressed={styles.centerButtonPressed}
+				styleText={styles.buttonText}
+				stylePressedText={styles.buttonPressedText}
+			/>
+		</>);
+	}
 };
 
 interface TextButtonProps {
@@ -917,6 +1147,18 @@ const styles = StyleSheet.create({
 	},
 	buttonDisabledText: {
 		color: '#b0b0b0',
+	},
+	centerButton: {
+		borderColor: 'black',
+		borderWidth: 1,
+		borderRadius: 40,
+		backgroundColor: 'white',
+		justifyContent: 'center',
+		alignSelf: 'center',
+		marginBottom: 20,
+	},
+	centerButtonPressed: {
+		backgroundColor: '#2196f3',
 	},
 	input: {
 		borderColor: '#b9b9b9',
