@@ -1,4 +1,3 @@
-import './polyfills.mjs'
 import b4a from 'b4a';
 import {
 	useEffect,

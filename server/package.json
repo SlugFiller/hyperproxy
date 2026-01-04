@@ -1,6 +1,8 @@
 {
+	"type": "module",
 	"dependencies": {
 		"hyperdht": "latest",
-		"@scure/bip39": "latest"
+		"@scure/bip39": "latest",
+		"@types/b4a": "latest"
 	}
 }

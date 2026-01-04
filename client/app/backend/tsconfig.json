@@ -1,0 +1,25 @@
+{
+	"compilerOptions": {
+		"allowUnusedLabels": false,
+		"allowUnreachableCode": false,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"noPropertyAccessFromIndexSignature": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+
+		"module": "nodenext",
+		"target": "esnext",
+		"outDir": "dist",
+		"strict": true,
+		"esModuleInterop": true,
+		"allowImportingTsExtensions": true,
+		"rewriteRelativeImportExtensions": true,
+		"verbatimModuleSyntax": true,
+		"sourceMap": true,
+		"skipLibCheck": true
+	},
+	"include": ["**/*.ts", "**/*.tsx"],
+	"exclude": ["**/node_modules", "**/Pods"]
+}

@@ -5,14 +5,13 @@
  * @format
  */
 
-import './polyfills.mjs'
 import {
 	entropyToMnemonic,
 	mnemonicToEntropy,
 } from '@scure/bip39';
 import {
 	wordlist,
-} from '@scure/bip39/wordlists/english';
+} from '@scure/bip39/wordlists/english.js';
 import b4a from 'b4a';
 import {
 	Children,
@@ -59,34 +58,45 @@ import {
 } from 'react-native-safe-area-context';
 import ToastManager, {
 	Toast,
-} from 'toastify-react-native'
+} from 'toastify-react-native';
 import {
 	useForegroundWorklet,
-} from './foreground-worklet.ts'
+} from './foreground-worklet.ts';
 import {
-	StreamSplitter,
-	anyPacket,
-	combineStreams,
-	consumeBuffer,
-	consumeUInt32LE,
-	packetUInt32LE,
-	readerFromNodeStream,
-	runStream,
-	streamPacketer,
-	writerFromNodeStream,
-} from './parse-utils.mjs'
+	Abort,
+} from './pin-stream/abort.ts';
 import {
-	RPC_KEYGEN,
-	RPC_LIST,
-	RPC_PROXY,
-	RPC_UNPROXY,
-	RPC_IS_PROXY,
-	RPC_UNPROXY_ALL,
-} from '../backend/rpc-commands.mjs';
-
-interface AbortSignalStatic {
-	any(signals: Iterable<AbortSignal>): AbortSignal;
-}
+	createClosedWritePin,
+	createPipe,
+	receiveValue,
+	receiveStop,
+	sendValue,
+	sendFinish,
+} from './pin-stream/pin-stream.ts';
+import type {
+	PipeWritePin,
+} from './pin-stream/pin-stream.ts';
+import {
+	processReadable,
+	processWritable,
+} from './pin-stream/pin-stream-compat.ts';
+import {
+	runProcesses,
+} from './pin-stream/processes.ts';
+import {
+	streamSplitter,
+} from './pin-stream/stream-splitter.ts';
+import type {
+	StreamSplitterStream,
+} from './pin-stream/stream-splitter.ts';
+import {
+	Unrace,
+} from './pin-stream/unrace.ts';
+import {
+	receiveRPCResponse,
+	receiveServerServiceList,
+	sendRPCRequest,
+} from '../backend/protocol.ts';
 
 enableSimpleNullHandling();
 
@@ -101,8 +111,8 @@ db.execute(`CREATE TABLE IF NOT EXISTS server(
 )`);
 db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS server__name ON server (name)`);
 
-function toBuffer(typedarray: Uint8Array<ArrayBuffer>): ArrayBuffer {
-	return typedarray.buffer.slice(typedarray.byteOffset, typedarray.byteOffset + typedarray.byteLength);
+function toBuffer(typedarray: Uint8Array): ArrayBuffer {
+	return (typedarray.buffer as ArrayBuffer).slice(typedarray.byteOffset, typedarray.byteOffset + typedarray.byteLength);
 }
 
 const App: FC = () => {
@@ -118,19 +128,14 @@ const App: FC = () => {
 	);
 };
 
-interface KeyPair {
-	publicKey: Uint8Array<ArrayBuffer>;
-	secretKey: Uint8Array<ArrayBuffer>;
-}
-
 type KeyPairStatus =
 	| {
 		status: 'loading',
 	}
 	| {
 		status: 'valid',
-		publicKey: Uint8Array<ArrayBuffer>,
-		secretKey: Uint8Array<ArrayBuffer>,
+		publicKey: Uint8Array,
+		secretKey: Uint8Array,
 	}
 	| {
 		status: 'error',
@@ -149,12 +154,12 @@ const AppContent: FC = () => {
 		| {
 			view: 'show',
 			name: string,
-			key: Uint8Array<ArrayBuffer>,
+			key: Uint8Array,
 		}
 		| {
 			view: 'service',
 			name: string,
-			key: Uint8Array<ArrayBuffer>,
+			key: Uint8Array,
 			service: string,
 		}
 		| {
@@ -182,8 +187,11 @@ const AppContent: FC = () => {
 
 	const IPC = useForegroundWorklet();
 
-	const splitter = useMemo(() => {
-		return new StreamSplitter();
+	const { pipe: { readPin: localStreamsReadPin, writePin: localStreamsWritePin }, unrace: localStreamsUnrace } = useMemo(() => {
+		return {
+			pipe: createPipe<StreamSplitterStream>(),
+			unrace: new Unrace(),
+		};
 	}, []);
 
 	useEffect(() => {
@@ -191,30 +199,49 @@ const AppContent: FC = () => {
 			return;
 		}
 
-		const controller = new AbortController();
-		runStream(combineStreams(
-			readerFromNodeStream(IPC),
-			splitter.split,
-			writerFromNodeStream(IPC)
-		), { signal: controller.signal }).catch(() => {
-			// If we're here, it's most likely due to abort. Ignore
+		const abort = new Abort();
+
+		runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: joinedOutput } = createPipe<Uint8Array>();
+			const { readPin: joinedInput, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await processReadable(IPC, writePin, options);
+			}, optionsProc);
+
+			await sendValue(processes, async (options) => {
+				await processWritable(readPin, IPC, options);
+			}, optionsProc);
+
+			await sendValue(processes, async (options) => {
+				await streamSplitter(joinedInput, joinedOutput, localStreamsReadPin, createClosedWritePin<StreamSplitterStream>(), options);
+			}, optionsProc);
+
+			await sendFinish(processes, optionsProc);
+		}, {
+			abort,
+		}).catch((error: unknown) => {
+			if (abort.aborted) {
+				return;
+			}
+			error instanceof Error && Toast.error(error.message);
 		});
 
 		return () => {
-			controller.abort();
+			abort.abort();
 		};
-	}, [IPC, splitter]);
+	}, [IPC, localStreamsReadPin]);
 
 	useEffect(() => {
-		const controller = new AbortController();
+		const abort = new Abort();
 
 		(async () => {
 			// Attempt to load key from storage
 			const keyPairRow = (await db.executeAsync<{ publicKey: ArrayBuffer, secretKey: ArrayBuffer }>(`SELECT publicKey, secretKey FROM keypair LIMIT 1`)).rows?.item(0);
+			if (abort.aborted) {
+				return;
+			}
 			if (keyPairRow) {
-				if (controller.signal.aborted) {
-					return;
-				}
 				setKeyPair({
 					status: 'valid',
 					publicKey: new Uint8Array(keyPairRow.publicKey),
@@ -224,20 +251,53 @@ const AppContent: FC = () => {
 			}
 
 			// Failed. Generate new key
-			const newKeyPair = await new Promise<KeyPair>((resolve) => {
-				splitter.createStream(async function* (stream, { signal } = {}) {
-					yield packetUInt32LE(RPC_KEYGEN);
-					for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
-						const publicKey = await consumeBuffer(packeter);
-						const secretKey = await consumeBuffer(packeter);
-						resolve({
-							publicKey,
-							secretKey,
+			const localAbort = new Abort();
+			let newKeyPair: {
+				publicKey: Uint8Array,
+				secretKey: Uint8Array,
+			};
+			try {
+				newKeyPair = await runProcesses(async (processes, options = {}) => {
+					const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+					const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+					// Send this socket as a new local connection to the stream splitter
+					await localStreamsUnrace.run(async () => {
+						await sendValue(localStreamsWritePin, {
+							readPin: streamReadPin,
+							writePin: streamWritePin,
+							localAbort,
+							remoteAbort: options.abort,
+						}, options);
+					}, options);
+
+					await sendValue(processes, async (optionsWrite = {}) => {
+						// Write request
+						await sendRPCRequest(writePin, {
+							type: 'keygen',
+						}, {
+							abort: optionsWrite.abort,
+							throwOnNoMore: true,
 						});
-					}
+
+						await sendFinish(writePin, optionsWrite);
+					}, options);
+
+					await sendFinish(processes, options);
+
+					// Read response
+					const response = await receiveRPCResponse(readPin, 'keygen', options);
+					await receiveStop(readPin, options);
+
+					return response;
+				}, {
+					abort,
 				});
-			});
-			if (controller.signal.aborted) {
+			}
+			finally {
+				localAbort.abort();
+			}
+			if (abort.aborted) {
 				return;
 			}
 			setKeyPair({
@@ -252,22 +312,24 @@ const AppContent: FC = () => {
 					toBuffer(newKeyPair.secretKey),
 				]
 			);
-		})().catch((error: Error) => {
-			if (controller.signal.aborted) {
+		})().catch((error: unknown) => {
+			if (abort.aborted) {
 				return;
 			}
-			setKeyPair({
-				status: 'error',
-				error,
-			});
+			if (error instanceof Error) {
+				setKeyPair({
+					status: 'error',
+					error,
+				});
+			}
 		});
 
 		return () => {
-			controller.abort();
+			abort.abort();
 		};
-	}, [splitter]);
+	}, [localStreamsWritePin, localStreamsUnrace]);
 
-	const selectServer = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
+	const selectServer = useCallback((name: string, key: Uint8Array) => {
 		setSelectedView({
 			view: 'show',
 			name,
@@ -289,7 +351,7 @@ const AppContent: FC = () => {
 			if (serverName === '') {
 				throw new Error('Server name empty');
 			}
-			const serverKey = mnemonicToEntropy(phrase, wordlist) as Uint8Array<ArrayBuffer>;
+			const serverKey = mnemonicToEntropy(phrase, wordlist);
 			// Queries that use buffer parameters must be sync
 			db.execute(`REPLACE INTO server(name, publicKey) VALUES (?, ?)`, [serverName, toBuffer(serverKey)]);
 			setServerListReload({});
@@ -307,7 +369,7 @@ const AppContent: FC = () => {
 			if (serverName === '') {
 				throw new Error('Server name empty');
 			}
-			const serverKey = mnemonicToEntropy(phrase, wordlist) as Uint8Array<ArrayBuffer>;
+			const serverKey = mnemonicToEntropy(phrase, wordlist);
 			db.execute(`UPDATE OR REPLACE server SET name = ?, publicKey = ? WHERE name = ?`, [serverName, toBuffer(serverKey), name]);
 			setServerListReload({});
 			setSelectedView({
@@ -330,23 +392,57 @@ const AppContent: FC = () => {
 			}
 			const serverKey = new Uint8Array(rows.item(0)!.publicKey);
 			db.execute(`DELETE FROM server WHERE name = ?`, [name]);
-			splitter.createStream(async function* (stream, { signal } = {}) {
-				yield packetUInt32LE(RPC_UNPROXY_ALL);
-				yield packetUInt32LE(serverKey.byteLength);
-				yield serverKey;
-				for await (const _discard of stream({ signal }));
+			const localAbort = new Abort();
+			runProcesses(async (processes, options = {}) => {
+				const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+				const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+				// Send this socket as a new local connection to the stream splitter
+				await localStreamsUnrace.run(async () => {
+					await sendValue(localStreamsWritePin, {
+						readPin: streamReadPin,
+						writePin: streamWritePin,
+						localAbort,
+						remoteAbort: options.abort,
+					}, options);
+				}, options);
+
+				await sendValue(processes, async (optionsWrite = {}) => {
+					// Write request
+					await sendRPCRequest(writePin, {
+						type: 'unproxy_all',
+						serverKey,
+					}, {
+						abort: optionsWrite.abort,
+						throwOnNoMore: true,
+					});
+
+					await sendFinish(writePin, optionsWrite);
+				}, options);
+
+				await sendFinish(processes, options);
+
+				// Ignore response
+				await receiveStop(readPin, options);
+			}).catch((error: unknown) => {
+				error instanceof Error && Toast.error(error.message);
+			}).then(() => {
+				localAbort.abort();
+				// Reload the list after the operation
 				setServerListReload({});
 				setSelectedView({
 					view: 'list',
 				});
+			}).catch((error: unknown) => {
+				error instanceof Error && Toast.error(error.message);
 			});
 		}
 		catch (error) {
 			error instanceof Error && Toast.error(error.message);
 		}
-	}, [serverName, setServerListReload, setSelectedView, splitter]);
+	}, [serverName, setServerListReload, setSelectedView, localStreamsWritePin, localStreamsUnrace]);
 
-	const moveToEdit = useCallback((name: string, key: Uint8Array<ArrayBuffer>) => {
+	const moveToEdit = useCallback((name: string, key: Uint8Array) => {
 		setServerName(name);
 		setPhrase(entropyToMnemonic(key, wordlist));
 		setSelectedView({
@@ -374,7 +470,8 @@ const AppContent: FC = () => {
 							<ServiceList
 								keyPair={keyPair}
 								serverKey={selectedView.key}
-								streamSplitter={splitter}
+								localStreamsWritePin={localStreamsWritePin}
+								localStreamsUnrace={localStreamsUnrace}
 								onSelect={selectService}
 							/>
 						</>)
@@ -391,7 +488,8 @@ const AppContent: FC = () => {
 								keyPair={keyPair}
 								serverKey={selectedView.key}
 								serviceName={selectedView.service}
-								streamSplitter={splitter}
+								localStreamsWritePin={localStreamsWritePin}
+								localStreamsUnrace={localStreamsUnrace}
 							/>
 						</>)
 						case 'add':
@@ -522,14 +620,14 @@ const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
 };
 
 interface ServerListProps {
-	onSelect?: (name: string, key: Uint8Array<ArrayBuffer>) => void;
+	onSelect?: (name: string, key: Uint8Array) => void;
 	reload: Record<string, never>;
 }
 
 const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 	interface Server {
 		name: string;
-		key: Uint8Array<ArrayBuffer>;
+		key: Uint8Array;
 	}
 
 	type ServerListStatus =
@@ -571,14 +669,16 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload }) => {
 				status: 'valid',
 				list,
 			});
-		})().catch((error: Error) => {
+		})().catch((error: unknown) => {
 			if (!active) {
 				return;
 			}
-			setServerList({
-				status: 'error',
-				error,
-			});
+			if (error instanceof Error) {
+				setServerList({
+					status: 'error',
+					error,
+				});
+			}
 		});
 		return () => {
 			active = false;
@@ -624,11 +724,12 @@ const ServerListSeparatorComponent: FC = () => {
 interface ServiceListProps {
 	onSelect?: (name: string) => void;
 	keyPair: KeyPairStatus;
-	serverKey: Uint8Array<ArrayBuffer>;
-	streamSplitter: StreamSplitter;
+	serverKey: Uint8Array;
+	localStreamsWritePin: PipeWritePin<StreamSplitterStream>;
+	localStreamsUnrace: Unrace;
 }
 
-const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, streamSplitter: splitter, onSelect }) => {
+const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWritePin, localStreamsUnrace, onSelect }) => {
 	const [services, setServices] = useState<string[]>([]);
 	const [loading, setLoading] = useState<boolean>(true);
 
@@ -639,36 +740,81 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, streamSplitter:
 
 		setLoading(true);
 
-		const controller = new AbortController();
+		const abort = new Abort();
 		const gotServices: string[] = [];
 
-		splitter.createStream(async function* (stream, { signal } = {}) {
-			yield packetUInt32LE(RPC_LIST);
-			yield packetUInt32LE(keyPair.publicKey.byteLength);
-			yield keyPair.publicKey;
-			yield packetUInt32LE(keyPair.secretKey.byteLength);
-			yield keyPair.secretKey;
-			yield packetUInt32LE(serverKey.byteLength);
-			yield serverKey;
-			for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
-				while (await anyPacket(packeter)) {
-					const service = b4a.toString(await consumeBuffer(packeter));
-					gotServices.push(service);
-					setServices([...gotServices]);
+		const localAbort = new Abort();
+		runProcesses(async (processes, options = {}) => {
+			const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+			const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+			// Send this socket as a new local connection to the stream splitter
+			await localStreamsUnrace.run(async () => {
+				await sendValue(localStreamsWritePin, {
+					readPin: streamReadPin,
+					writePin: streamWritePin,
+					localAbort,
+					remoteAbort: options.abort,
+				}, options);
+			}, options);
+
+			await sendValue(processes, async (optionsWrite = {}) => {
+				// Write request
+				await sendRPCRequest(writePin, {
+					type: 'list',
+					publicKey: keyPair.publicKey,
+					secretKey: keyPair.secretKey,
+					serverKey,
+				}, {
+					abort: optionsWrite.abort,
+					throwOnNoMore: true,
+				});
+
+				await sendFinish(writePin, optionsWrite);
+			});
+
+			// Read response
+			const { readPin: serviceListReadPin, writePin: serviceListWritePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (optionsList) => {
+				await receiveServerServiceList(readPin, serviceListWritePin, optionsList);
+			});
+
+			await sendFinish(processes, options);
+
+			while (true) {
+				const result = await receiveValue(serviceListReadPin, options);
+				if (result.done) {
+					break;
 				}
+
+				const service = b4a.toString(result.value);
+				gotServices.push(service);
+				setServices([...gotServices]);
 			}
+		}, {
+			abort,
+		}).catch((error: unknown) => {
+			if (abort.aborted) {
+				return;
+			}
+			error instanceof Error && Toast.error(error.message);
+		}).then(() => {
+			localAbort.abort();
 			setLoading(false);
+		}).catch((error: unknown) => {
+			error instanceof Error && Toast.error(error.message);
 		});
 
 		return () => {
-			controller.abort();
+			abort.abort();
 		};
-	}, [keyPair, serverKey, splitter]);
+	}, [keyPair, serverKey, localStreamsWritePin, localStreamsUnrace, setServices, setLoading]);
 
 	return (
 		<View style={styles.container}>
-			{loading && (
-				<ActivityIndicator size="large" style={styles.floatingLoader} />
+			{loading && !services.length && (
+				<ActivityIndicator size="large" />
 			)}
 			{services.length && (
 				<FlatList
@@ -683,6 +829,9 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, streamSplitter:
 					): (
 						<Text style={[styles.serviceListItem]}>{name}</Text>
 					)}
+					ListFooterComponent={loading ? (
+						<ActivityIndicator size="large" />
+					) : null}
 					ItemSeparatorComponent={ServiceListSeparatorComponent}
 				/>
 			) || (!loading && (
@@ -700,12 +849,13 @@ const ServiceListSeparatorComponent: FC = () => {
 
 interface ServiceProxyProps {
 	keyPair: KeyPairStatus;
-	serverKey: Uint8Array<ArrayBuffer>;
+	serverKey: Uint8Array;
 	serviceName: string;
-	streamSplitter: StreamSplitter;
+	localStreamsWritePin: PipeWritePin<StreamSplitterStream>;
+	localStreamsUnrace: Unrace;
 }
 
-const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, streamSplitter: splitter }) => {
+const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, localStreamsWritePin, localStreamsUnrace }) => {
 	type ProxyStatus =
 		| {
 			status: 'loading',
@@ -726,86 +876,198 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 	const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ status: 'loading' });
 
 	useEffect(() => {
-		const controller = new AbortController();
+		const abort = new Abort();
 
-		splitter.createStream(async function* (stream, { signal } = {}) {
-			yield packetUInt32LE(RPC_IS_PROXY);
-			yield packetUInt32LE(serverKey.byteLength);
-			yield serverKey;
-			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
-			yield packetUInt32LE(serviceBuf.byteLength);
-			yield serviceBuf;
-			for await (const packeter of streamPacketer(stream({ signal: signal ? (AbortSignal as unknown as AbortSignalStatic).any([signal, controller.signal]) : controller.signal }))) {
-				const port = await consumeUInt32LE(packeter);
-				if (port > 0) {
-					setProxyStatus({
-						status: 'active',
-						port,
+		(async () => {
+			const localAbort = new Abort();
+			let port: number;
+			try {
+				port = await runProcesses(async (processes, options = {}) => {
+					const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+					const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+					// Send this socket as a new local connection to the stream splitter
+					await localStreamsUnrace.run(async () => {
+						await sendValue(localStreamsWritePin, {
+							readPin: streamReadPin,
+							writePin: streamWritePin,
+							localAbort,
+							remoteAbort: options.abort,
+						}, options);
+					}, options);
+
+					await sendValue(processes, async (optionsWrite = {}) => {
+						// Write request
+						await sendRPCRequest(writePin, {
+							type: 'is_proxy',
+							serverKey,
+							serviceName: b4a.from(serviceName),
+						}, {
+							abort: optionsWrite.abort,
+							throwOnNoMore: true,
+						});
+
+						await sendFinish(writePin, optionsWrite);
 					});
-				}
-				else {
-					setProxyStatus({
-						status: 'available',
-					});
-				}
+
+					await sendFinish(processes, options);
+
+					// Read response
+					const response = await receiveRPCResponse(readPin, 'is_proxy', options);
+					await receiveStop(readPin, options);
+
+					return response.port;
+				}, {
+					abort,
+				});
 			}
+			finally {
+				localAbort.abort();
+			}
+			if (abort.aborted) {
+				return;
+			}
+			if (port > 0) {
+				setProxyStatus({
+					status: 'active',
+					port,
+				});
+			}
+			else {
+				setProxyStatus({
+					status: 'available',
+				});
+			}
+		})().catch((error: unknown) => {
+			if (abort.aborted) {
+				return;
+			}
+			error instanceof Error && Toast.error(error.message);
 		});
 
 		return () => {
-			controller.abort();
+			abort.abort();
 		};
-	}, [serverKey, serviceName, splitter, setProxyStatus]);
+	}, [serverKey, serviceName, localStreamsWritePin, localStreamsUnrace, setProxyStatus]);
 
 	const startProxy = useCallback(() => {
 		if (keyPair.status !== 'valid') {
 			return;
 		}
 
-		splitter.createStream(async function* (stream, { signal } = {}) {
-			yield packetUInt32LE(RPC_PROXY);
-			yield packetUInt32LE(keyPair.publicKey.byteLength);
-			yield keyPair.publicKey;
-			yield packetUInt32LE(keyPair.secretKey.byteLength);
-			yield keyPair.secretKey;
-			yield packetUInt32LE(serverKey.byteLength);
-			yield serverKey;
-			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
-			yield packetUInt32LE(serviceBuf.byteLength);
-			yield serviceBuf;
-			for await (const packeter of streamPacketer(stream({ signal }))) {
-				const port = await consumeUInt32LE(packeter);
-				if (port > 0) {
-					setProxyStatus({
-						status: 'active',
-						port,
+		(async () => {
+			const localAbort = new Abort();
+			let port: number;
+			try {
+				port = await runProcesses(async (processes, options = {}) => {
+					const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+					const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+					// Send this socket as a new local connection to the stream splitter
+					await localStreamsUnrace.run(async () => {
+						await sendValue(localStreamsWritePin, {
+							readPin: streamReadPin,
+							writePin: streamWritePin,
+							localAbort,
+							remoteAbort: options.abort,
+						}, options);
+					}, options);
+
+					await sendValue(processes, async (optionsWrite = {}) => {
+						// Write request
+						await sendRPCRequest(writePin, {
+							type: 'proxy',
+							publicKey: keyPair.publicKey,
+							secretKey: keyPair.secretKey,
+							serverKey,
+							serviceName: b4a.from(serviceName),
+						}, {
+							abort: optionsWrite.abort,
+							throwOnNoMore: true,
+						});
+
+						await sendFinish(writePin, optionsWrite);
 					});
-				}
+
+					await sendFinish(processes, options);
+
+					// Read response
+					const response = await receiveRPCResponse(readPin, 'proxy', options);
+					await receiveStop(readPin, options);
+
+					return response.port;
+				});
 			}
+			finally {
+				localAbort.abort();
+			}
+			if (port > 0) {
+				setProxyStatus({
+					status: 'active',
+					port,
+				});
+			}
+		})().catch((error: unknown) => {
+			error instanceof Error && Toast.error(error.message);
 		});
-	}, [keyPair, serverKey, serviceName, splitter]);
+	}, [keyPair, serverKey, serviceName, localStreamsWritePin, localStreamsUnrace, setProxyStatus]);
 
 	const stopProxy = useCallback(() => {
-		splitter.createStream(async function* (stream, { signal } = {}) {
-			yield packetUInt32LE(RPC_UNPROXY);
-			yield packetUInt32LE(serverKey.byteLength);
-			yield serverKey;
-			const serviceBuf = b4a.from(serviceName) as Uint8Array<ArrayBuffer>;
-			yield packetUInt32LE(serviceBuf.byteLength);
-			yield serviceBuf;
-			for await (const _discard of stream({ signal }));
-			setProxyStatus({
-				status: 'available',
-			});
+		(async () => {
+			const localAbort = new Abort();
+			try {
+				await runProcesses(async (processes, options = {}) => {
+					const { readPin, writePin: streamWritePin } = createPipe<Uint8Array>();
+					const { readPin: streamReadPin, writePin } = createPipe<Uint8Array>();
+
+					// Send this socket as a new local connection to the stream splitter
+					await localStreamsUnrace.run(async () => {
+						await sendValue(localStreamsWritePin, {
+							readPin: streamReadPin,
+							writePin: streamWritePin,
+							localAbort,
+							remoteAbort: options.abort,
+						}, options);
+					}, options);
+
+					await sendValue(processes, async (optionsWrite = {}) => {
+						// Write request
+						await sendRPCRequest(writePin, {
+							type: 'unproxy',
+							serverKey,
+							serviceName: b4a.from(serviceName),
+						}, {
+							abort: optionsWrite.abort,
+							throwOnNoMore: true,
+						});
+
+						await sendFinish(writePin, optionsWrite);
+					});
+
+					await sendFinish(processes, options);
+
+					// Ignore response
+					await receiveStop(readPin, options);
+				});
+				setProxyStatus({
+					status: 'available',
+				});
+			}
+			finally {
+				localAbort.abort();
+			}
+		})().catch((error: unknown) => {
+			error instanceof Error && Toast.error(error.message);
 		});
-	}, [serverKey, serviceName, splitter]);
+	}, [serverKey, serviceName, localStreamsWritePin, localStreamsUnrace, setProxyStatus]);
 
 	const startBrowser = useCallback(() => {
 		if (proxyStatus.status !== 'active') {
 			return;
 		}
 
-		Linking.openURL(`http://localhost:${ proxyStatus.port }`).catch((error: Error) => {
-			Toast.error(error.message);
+		Linking.openURL(`http://localhost:${ proxyStatus.port }`).catch((error: unknown) => {
+			error instanceof Error && Toast.error(error.message);
 		});
 	}, [proxyStatus]);
 
@@ -1180,12 +1442,6 @@ const styles = StyleSheet.create({
 		fontSize: 15,
 		padding: 5,
 	},
-	floatingLoader: {
-		position: 'absolute',
-		left: 0,
-		right: 0,
-		zIndex: 1,
-	}
 });
 
 export default App;

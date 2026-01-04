@@ -1,0 +1,23 @@
+{
+	"compilerOptions": {
+		"allowUnusedLabels": false,
+		"allowUnreachableCode": false,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"noPropertyAccessFromIndexSignature": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+
+		"noEmit": true,
+		"module": "nodenext",
+		"target": "esnext",
+		"strict": true,
+		"esModuleInterop": true,
+		"allowImportingTsExtensions": true,
+		"rewriteRelativeImportExtensions": true,
+		"verbatimModuleSyntax": true,
+		"sourceMap": true,
+		"skipLibCheck": true
+	}
+}
