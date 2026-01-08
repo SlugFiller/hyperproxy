@@ -874,6 +874,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 	;
 
 	const [proxyStatus, setProxyStatus] = useState<ProxyStatus>({ status: 'loading' });
+	const [portStr, setPort] = useState<string>('');
+
+	const setPortInput = useCallback((text: string) => {
+		setPort(text.replace(/[^0-9]+/g, ''));
+	}, [setPort]);
 
 	useEffect(() => {
 		const abort = new Abort();
@@ -974,9 +979,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					}, options);
 
 					await sendValue(processes, async (optionsWrite = {}) => {
+						const portNum: number = portStr === '' ? 0 : parseInt(portStr, 10);
 						// Write request
 						await sendRPCRequest(writePin, {
 							type: 'proxy',
+							port: (Number.isSafeInteger(portNum) && portNum > 0 && portNum < 65536) ? portNum : 0,
 							publicKey: keyPair.publicKey,
 							secretKey: keyPair.secretKey,
 							serverKey,
@@ -1010,7 +1017,7 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 		})().catch((error: unknown) => {
 			error instanceof Error && Toast.error(error.message);
 		});
-	}, [keyPair, serverKey, serviceName, localStreamsWritePin, localStreamsUnrace, setProxyStatus]);
+	}, [portStr, keyPair, serverKey, serviceName, localStreamsWritePin, localStreamsUnrace, setProxyStatus]);
 
 	const stopProxy = useCallback(() => {
 		(async () => {
@@ -1082,7 +1089,7 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 				<Text>{proxyStatus.error.stack}</Text>
 			</View>
 		);
-		case 'available': return (
+		case 'available': return (<>
 			<TextButton
 				title="Proxy"
 				onPress={startProxy}
@@ -1091,7 +1098,12 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 				styleText={styles.buttonText}
 				stylePressedText={styles.buttonPressedText}
 			/>
-		);
+			<Text style={styles.labelPort}>Port</Text>
+			<View style={styles.inputPortContainer}>
+				<Text style={styles.inputPortFiller}>00000</Text>
+				<TextInput value={portStr} onChangeText={setPortInput} keyboardType="number-pad" maxLength={5} style={styles.inputPort} />
+			</View>
+		</>);
 		case 'active': return (<>
 			<TextButton
 				title="Stop"
@@ -1101,6 +1113,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 				styleText={styles.buttonText}
 				stylePressedText={styles.buttonPressedText}
 			/>
+			<Text style={styles.labelPort}>Port</Text>
+			<View style={styles.inputPortContainer}>
+				<Text style={styles.inputPortFiller}>00000</Text>
+				<TextInput value={`${ proxyStatus.port }`} editable={false} style={styles.inputPort} />
+			</View>
 			<TextButton
 				title="Launch browser"
 				onPress={startBrowser}
@@ -1430,6 +1447,32 @@ const styles = StyleSheet.create({
 		height: 40,
 		paddingLeft: 3,
 		flex: 1,
+	},
+	inputPort: {
+		borderColor: 'black',
+		borderWidth: 1,
+		borderRadius: 40,
+		backgroundColor: 'white',
+		justifyContent: 'center',
+		marginBottom: 20,
+		textAlign: 'center',
+		padding: 20,
+		fontSize: 20,
+	},
+	inputPortContainer: {
+		alignSelf: 'center',
+	},
+	inputPortFiller: {
+		alignSelf: 'center',
+		height: 0,
+		fontSize: 20,
+		paddingHorizontal: 21,
+	},
+	labelPort: {
+		alignSelf: 'center',
+		marginBottom: 20,
+		textAlign: 'center',
+		fontSize: 20,
 	},
 	autoCompleteContainer: {
 		borderColor: '#b9b9b9',

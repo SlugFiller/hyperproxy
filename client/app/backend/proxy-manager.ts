@@ -46,7 +46,7 @@ const activeProxies = new Map<string, Map<string, {
 export async function addOrGetProxy(node: DHT, keyPair: {
 	publicKey: Uint8Array,
 	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array): Promise<number> {
+}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
 	const server64 = b4a.toString(serverKey, 'base64');
 	const service64 = b4a.toString(serviceName, 'base64');
 	if (!activeProxies.has(server64)) {
@@ -57,7 +57,7 @@ export async function addOrGetProxy(node: DHT, keyPair: {
 	if (prev) {
 		return prev.port;
 	}
-	const created = await createProxy(node, keyPair, serverKey, serviceName);
+	const created = await createProxy(node, keyPair, serverKey, serviceName, port);
 	services.set(service64, created);
 	return created.port;
 }
@@ -109,7 +109,7 @@ export function removeAllProxies(serverKey: Uint8Array): void {
 async function createProxy(node: DHT, keyPair: {
 	publicKey: Uint8Array,
 	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array): Promise<{
+}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<{
 	port: number,
 	abort: Abort,
 }> {
@@ -187,6 +187,11 @@ async function createProxy(node: DHT, keyPair: {
 
 	// Listen for incoming connections
 	const server = createServer();
+	server.on('error', (error: unknown) => {
+		// The default behavior for `EventEmitter` is to crash the VM if an error
+		// is emitted without a handler. This handler pre-emptively prevents this
+		console.log('Listener error', error);
+	});
 	server.on('connection', (socket) => {
 		socket.on('error', (error: unknown) => {
 			// The default behavior for `EventEmitter` is to crash the VM if an error
@@ -267,12 +272,31 @@ async function createProxy(node: DHT, keyPair: {
 		console.log(error);
 	});
 
-	// Listen only on localhost, on a random port
-	await new Promise<void>((resolve) => {
-		server.listen(0, '127.0.0.1', resolve);
-	});
-	return {
-		port: server.address().port,
-		abort,
-	};
+	// Listen only on localhost, on the specified port, or on a random port if the port is 0
+	try {
+		await new Promise<void>((resolve, reject) => {
+			function onListening() {
+				server.off('listening', onListening);
+				server.off('error', onError);
+				resolve();
+			}
+			function onError(error: unknown) {
+				server.off('listening', onListening);
+				server.off('error', onError);
+				reject(error);
+			}
+			server.on('listening', onListening);
+			server.on('error', onError);
+			server.listen(port, '127.0.0.1');
+		});
+		return {
+			port: server.address().port,
+			abort,
+		};
+	}
+	catch (error) {
+		// If listener failed to start, ensure the connection to the server is closed as well
+		abort.abort(error);
+		throw error;
+	}
 }

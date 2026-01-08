@@ -25,6 +25,7 @@ export type RPCRequestPacket = {
 	serverKey: Uint8Array,
 } | {
 	type: 'proxy',
+	port: number,
 	publicKey: Uint8Array,
 	secretKey: Uint8Array,
 	serverKey: Uint8Array,
@@ -118,19 +119,20 @@ export async function receiveRPCRequest(input: PipeReadPin<Uint8Array>, options?
 			}
 
 			case 2: {	// proxy
-				if (buffer.length < 17) {
+				if (buffer.length < 19) {
 					// Need more data
 					return Promise.resolve({
 						complete: false,
 					});
 				}
 
-				const publicKeyLength = dataview.getUint32(1, true);
-				const secretKeyLength = dataview.getUint32(5, true);
-				const serverKeyLength = dataview.getUint32(9, true);
-				const serviceNameLength = dataview.getUint32(13, true);
+				const port = dataview.getUint16(1, true);
+				const publicKeyLength = dataview.getUint32(3, true);
+				const secretKeyLength = dataview.getUint32(7, true);
+				const serverKeyLength = dataview.getUint32(11, true);
+				const serviceNameLength = dataview.getUint32(15, true);
 
-				if (buffer.length < 17 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength) {
+				if (buffer.length < 19 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength) {
 					// Need more data
 					return Promise.resolve({
 						complete: false,
@@ -141,12 +143,13 @@ export async function receiveRPCRequest(input: PipeReadPin<Uint8Array>, options?
 					complete: true,
 					packet: {
 						type: 'proxy',
-						publicKey: buffer.subarray(17, 17 + publicKeyLength),
-						secretKey: buffer.subarray(17 + publicKeyLength, 17 + publicKeyLength + secretKeyLength),
-						serverKey: buffer.subarray(17 + publicKeyLength + secretKeyLength, 17 + publicKeyLength + secretKeyLength + serverKeyLength),
-						serviceName: buffer.subarray(17 + publicKeyLength + secretKeyLength + serverKeyLength, 17 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength),
+						port,
+						publicKey: buffer.subarray(19, 19 + publicKeyLength),
+						secretKey: buffer.subarray(19 + publicKeyLength, 19 + publicKeyLength + secretKeyLength),
+						serverKey: buffer.subarray(19 + publicKeyLength + secretKeyLength, 19 + publicKeyLength + secretKeyLength + serverKeyLength),
+						serviceName: buffer.subarray(19 + publicKeyLength + secretKeyLength + serverKeyLength, 19 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength),
 					},
-					bytesUsed: 17 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength,
+					bytesUsed: 19 + publicKeyLength + secretKeyLength + serverKeyLength + serviceNameLength,
 				});
 			}
 
@@ -269,17 +272,18 @@ export async function sendRPCRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'proxy': {
-			encoded = new Uint8Array(17 + request.publicKey.length + request.secretKey.length + request.serverKey.length + request.serviceName.length);
+			encoded = new Uint8Array(19 + request.publicKey.length + request.secretKey.length + request.serverKey.length + request.serviceName.length);
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = 2;
-			dataview.setUint32(1, request.publicKey.length, true);
-			dataview.setUint32(5, request.secretKey.length, true);
-			dataview.setUint32(9, request.serverKey.length, true);
-			dataview.setUint32(13, request.serviceName.length, true);
-			encoded.set(request.publicKey, 17);
-			encoded.set(request.secretKey, 17 + request.publicKey.length);
-			encoded.set(request.serverKey, 17 + request.publicKey.length + request.secretKey.length);
-			encoded.set(request.serviceName, 17 + request.publicKey.length + request.secretKey.length + request.serverKey.length);
+			dataview.setUint16(1, request.port, true);
+			dataview.setUint32(3, request.publicKey.length, true);
+			dataview.setUint32(7, request.secretKey.length, true);
+			dataview.setUint32(11, request.serverKey.length, true);
+			dataview.setUint32(15, request.serviceName.length, true);
+			encoded.set(request.publicKey, 19);
+			encoded.set(request.secretKey, 19 + request.publicKey.length);
+			encoded.set(request.serverKey, 19 + request.publicKey.length + request.secretKey.length);
+			encoded.set(request.serviceName, 19 + request.publicKey.length + request.secretKey.length + request.serverKey.length);
 			break;
 		}
 

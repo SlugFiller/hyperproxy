@@ -117,7 +117,7 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 				port: await addOrGetProxy(node, {
 					publicKey: request.publicKey,
 					secretKey: request.secretKey,
-				}, request.serverKey, request.serviceName),
+				}, request.serverKey, request.serviceName, request.port),
 			}, options);
 			await sendFinish(writePin, options);
 			break;
