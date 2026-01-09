@@ -55,38 +55,58 @@ import type {
 	StreamSplitterStream,
 } from './pin-stream/stream-splitter.ts';
 import {
+	receiveCmdProxyList,
 	receiveCmdRemoteList,
 	receiveCmdRequest,
 	receiveCmdResponse,
+	receiveCmdServerList,
 	receiveCmdServiceList,
 	receiveServerRequest,
+	receiveServerServiceList,
+	sendCmdProxyList,
 	sendCmdRemoteList,
 	sendCmdRequest,
 	sendCmdResponse,
+	sendCmdServerList,
 	sendCmdServiceList,
+	sendServerRequest,
 	sendServerServiceList,
 } from './protocol.ts';
+import {
+	addProxy,
+	getActiveProxies,
+	removeProxiesByServer,
+	removeProxyByPort,
+} from './proxy-manager.ts';
+import type {
+	ActiveProxy,
+} from './proxy-manager.ts';
 
 const CMD_PATH = platform === 'win32' ? '\\\\.\\pipe\\hyperproxy-daemon' : '/tmp/hyperproxy-daemon.sock';
 
-async function daemon(): Promise<void> {
+async function daemon(noServe: boolean): Promise<void> {
 	const db = new DatabaseSync(fileURLToPath(new URL('config.sqlite', import.meta.url)));
 
 	db.exec(`CREATE TABLE IF NOT EXISTS keypair(
-		publicKey BLOB,
-		secretKey BLOB
+		publicKey BLOB NOT NULL,
+		secretKey BLOB NOT NULL
 	)`);
 	db.exec(`CREATE TABLE IF NOT EXISTS remotes(
-		publicKey BLOB
+		publicKey BLOB NOT NULL
 	)`);
 	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS remotes__pubkey ON remotes (publicKey)`);
 	db.exec(`CREATE TABLE IF NOT EXISTS services(
-		port INTEGER,
-		name BLOB
+		name BLOB NOT NULL,
+		host TEXT,
+		port INTEGER NOT NULL
 	)`);
-	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS services__port ON services (port)`);
+	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS services__name_unique ON services (name)`);
 	db.exec(`CREATE INDEX IF NOT EXISTS services__name ON services (LENGTH(name), name)`);
-	db.exec(`CREATE INDEX IF NOT EXISTS services__name_nolen ON services (name)`);
+	db.exec(`CREATE TABLE IF NOT EXISTS servers(
+		name TEXT,
+		publicKey BLOB
+	)`);
+	db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS servers__name ON servers (name)`);
 
 	const queryKeyPair = db.prepare(`SELECT publicKey, secretKey FROM keypair LIMIT 1`);
 	const queryKeyPairStore = db.prepare(`INSERT INTO keypair(publicKey, secretKey) SELECT $publicKey, $secretKey
@@ -95,13 +115,17 @@ async function daemon(): Promise<void> {
 	const queryListServices = db.prepare(`SELECT name FROM services ORDER BY name ASC`);
 	const queryCheckServiceLength = db.prepare(`SELECT 1 FROM services WHERE LENGTH(name) = $length LIMIT 1`);
 	const queryCheckServicePrefix = db.prepare(`SELECT 1 FROM services WHERE LENGTH(name) = $length AND name >= $prefix AND name < $prefixPlus LIMIT 1`);
-	const queryGetServiceByName = db.prepare(`SELECT port FROM services WHERE LENGTH(name) = $length AND name = $match LIMIT 1`);
-	const queryGetServices = db.prepare(`SELECT port, name FROM services ORDER BY port ASC`);
+	const queryGetServiceByName = db.prepare(`SELECT host, port FROM services WHERE LENGTH(name) = $length AND name = $match LIMIT 1`);
+	const queryGetServices = db.prepare(`SELECT name, host, port FROM services ORDER BY name ASC`);
 	const queryGetRemotes = db.prepare(`SELECT publicKey FROM remotes ORDER BY publicKey ASC`);
-	const queryAddService = db.prepare(`REPLACE INTO services(port, name) VALUES ($port, $name)`);
-	const queryRemoveService = db.prepare(`DELETE FROM services WHERE port = $port`);
+	const queryGetServerByName = db.prepare(`SELECT publicKey FROM servers WHERE name = $name LIMIT 1`);
+	const queryGetServers = db.prepare(`SELECT name, publicKey FROM servers ORDER BY name ASC`);
+	const queryAddService = db.prepare(`REPLACE INTO services(host, port, name) VALUES ($host, $port, $name)`);
+	const queryRemoveService = db.prepare(`DELETE FROM services WHERE name = $name`);
 	const queryAddRemote = db.prepare(`INSERT OR IGNORE INTO remotes(publicKey) VALUES ($publicKey)`);
 	const queryRemoveRemote = db.prepare(`DELETE FROM remotes WHERE publicKey = $publicKey`);
+	const queryAddServer = db.prepare(`REPLACE INTO servers(name, publicKey) VALUES ($name, $publicKey)`);
+	const queryRemoveServer = db.prepare(`DELETE FROM servers WHERE name = $name`);
 
 	const node = new DHT();
 
@@ -219,12 +243,14 @@ async function daemon(): Promise<void> {
 						$length: request.serviceName.length,
 						$match: request.serviceName,
 					}) as (undefined | {
+						host: Uint8Array | null,
 						port: number,
 					});
 					if (!row) {
 						throw new Error('Service does not exist');
 					}
 					const port = row.port;
+					const host = row.host ? Buffer.from(row.host).toString() : 'localhost';
 
 					const { readPin: remoteStreamsReadPin, writePin: remoteStreamsWritePin } = createPipe<StreamSplitterStream>();
 
@@ -247,7 +273,7 @@ async function daemon(): Promise<void> {
 
 						await sendValue(processes, async () => {
 							try {
-								const proxied = createConnection(port, 'localhost');
+								const proxied = createConnection(port, host);
 								proxied.on('error', (error: unknown) => {
 									// The default behavior for `EventEmitter` is to crash the VM if an error
 									// is emitted without a handler. This handler pre-emptively prevents this
@@ -300,7 +326,9 @@ async function daemon(): Promise<void> {
 		});
 	});
 
-	await server.listen(keyPair);
+	if (!noServe) {
+		await server.listen(keyPair);
+	}
 
 	const cmd = createServer();
 	cmd.on('error', (error: unknown) => {
@@ -343,6 +371,7 @@ async function daemon(): Promise<void> {
 
 				case 'show_services': {
 					const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
+						host?: string,
 						port: number,
 						name: Uint8Array,
 					}>();
@@ -352,9 +381,18 @@ async function daemon(): Promise<void> {
 					}, optionsProc);
 
 					for (const row of queryGetServices.iterate()) {
-						await sendValue(listWritePin, row as {
-							port: number,
+						const service = row as {
 							name: Uint8Array,
+							host: string | null,
+							port: number,
+						};
+						await sendValue(listWritePin, service.host === null ? {
+							name: service.name,
+							port: service.port,
+						} : {
+							name: service.name,
+							host: service.host,
+							port: service.port,
 						}, optionsProc);
 					}
 
@@ -379,8 +417,45 @@ async function daemon(): Promise<void> {
 					break;
 				}
 
+				case 'show_servers': {
+					const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
+						name: string,
+						publicKey: Uint8Array,
+					}>();
+
+					await sendValue(processes, async (options) => {
+						await sendCmdServerList(listReadPin, writePin, options);
+					}, optionsProc);
+
+					for (const row of queryGetServers.iterate()) {
+						await sendValue(listWritePin, row as {
+							name: string,
+							publicKey: Uint8Array,
+						}, optionsProc);
+					}
+
+					await sendFinish(listWritePin, optionsProc);
+					break;
+				}
+
+				case 'show_proxies': {
+					const { readPin: listReadPin, writePin: listWritePin } = createPipe<ActiveProxy>();
+
+					await sendValue(processes, async (options) => {
+						await sendCmdProxyList(listReadPin, writePin, options);
+					}, optionsProc);
+
+					for (const proxy of getActiveProxies()) {
+						await sendValue(listWritePin, proxy, optionsProc);
+					}
+
+					await sendFinish(listWritePin, optionsProc);
+					break;
+				}
+
 				case 'add_service': {
 					queryAddService.run({
+						$host: request.host ?? null,
 						$port: request.port,
 						$name: request.name,
 					});
@@ -390,7 +465,7 @@ async function daemon(): Promise<void> {
 
 				case 'remove_service': {
 					queryRemoveService.run({
-						$port: request.port,
+						$name: request.name,
 					});
 					await sendFinish(writePin, optionsProc);
 					break;
@@ -408,6 +483,101 @@ async function daemon(): Promise<void> {
 					queryRemoveRemote.run({
 						$publicKey: request.publicKey,
 					});
+					await sendFinish(writePin, optionsProc);
+					break;
+				}
+
+				case 'add_server': {
+					queryAddServer.run({
+						$name: request.name,
+						$publicKey: request.publicKey,
+					});
+					// In case a previous server with a different name was overwritten
+					removeProxiesByServer(request.name);
+					await sendFinish(writePin, optionsProc);
+					break;
+				}
+
+				case 'remove_server': {
+					queryRemoveServer.run({
+						$name: request.name,
+					});
+					removeProxiesByServer(request.name);
+					await sendFinish(writePin, optionsProc);
+					break;
+				}
+
+				case 'list': {
+					const row = queryGetServerByName.get({
+						$name: request.serverName,
+					}) as (undefined | {
+						publicKey: Uint8Array,
+					});
+					if (!row) {
+						throw new Error('Server does not exist');
+					}
+
+					const { readPin: commandReadPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+
+					// Connect to server
+					const socketConn = node.connect(row.publicKey, {
+						keyPair,
+					});
+					socketConn.on('error', (error: unknown) => {
+						// The default behavior for `EventEmitter` is to crash the VM if an error
+						// is emitted without a handler. This handler pre-emptively prevents this
+						console.log('Request socket error', error);
+					});
+
+					try {
+						await runProcesses(async (processes, optionsConn) => {
+							await sendValue(processes, async (optionsSub) => {
+								// Stream the result directly to the write pin
+								await processReadable(socketConn, writePin, optionsSub);
+							}, optionsConn);
+
+							await sendValue(processes, async (optionsSub) => {
+								await processWritable(commandReadPin, socketConn, optionsSub);
+							}, optionsConn);
+
+							await sendFinish(processes, optionsConn);
+
+							// Send the request packet
+							await sendServerRequest(commandWritePin, {
+								type: 'list',
+							}, optionsConn);
+
+							await sendFinish(commandWritePin, optionsConn);
+						}, optionsProc);
+					}
+					finally {
+						socketConn.destroy();
+					}
+
+					break;
+				}
+
+				case 'proxy': {
+					const row = queryGetServerByName.get({
+						$name: request.serverName,
+					}) as (undefined | {
+						publicKey: Uint8Array,
+					});
+					if (!row) {
+						throw new Error('Server does not exist');
+					}
+
+					const port = await addProxy(node, keyPair, request.serverName, row.publicKey, request.serviceName, request.port);
+					await sendCmdResponse(writePin, {
+						type: 'proxy',
+						port,
+					}, optionsProc);
+					await sendFinish(writePin, optionsProc);
+					break;
+				}
+
+				case 'unproxy': {
+					removeProxyByPort(request.port);
 					await sendFinish(writePin, optionsProc);
 					break;
 				}
@@ -466,7 +636,7 @@ function printKey(publicKey: Uint8Array): void {
 
 async function app(): Promise<void> {
 	if (argv[2] === 'daemon') {
-		return await daemon();
+		return await daemon(argv[3] === 'noserve');
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'key') {
@@ -479,11 +649,8 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'show_key',
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'show_key',
 			}, optionsProc);
 
 			// Print result
@@ -491,6 +658,9 @@ async function app(): Promise<void> {
 			printKey(result.publicKey);
 
 			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
@@ -504,17 +674,15 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'show_services',
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'show_services',
 			}, optionsProc);
 
 			// Receive list
 			const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
-				port: number,
 				name: Uint8Array,
+				host?: string,
+				port: number,
 			}>();
 
 			await sendValue(processes, async (options) => {
@@ -528,11 +696,20 @@ async function app(): Promise<void> {
 					break;
 				}
 				const {
-					port,
 					name,
+					host,
+					port,
 				} = result.value;
-				console.log(`${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
+				if (host) {
+					console.log(`${ host } ${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
+				}
+				else {
+					console.log(`${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
+				}
 			}
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
@@ -546,11 +723,8 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'show_remotes',
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'show_remotes',
 			}, optionsProc);
 
 			// Receive list
@@ -563,6 +737,8 @@ async function app(): Promise<void> {
 			// Print result
 			const first = await receiveValue(listReadPin, optionsProc);
 			if (first.done) {
+				// Finish must be delayed until after read, because pipes can't be half-closed
+				await sendFinish(writePin, optionsProc);
 				return;
 			}
 
@@ -576,18 +752,124 @@ async function app(): Promise<void> {
 				console.log();
 				printKey(result.value);
 			}
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'show' && argv[3] === 'servers') {
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'show_servers',
+			}, optionsProc);
+
+			// Receive list
+			const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
+				name: string,
+				publicKey: Uint8Array,
+			}>();
+
+			await sendValue(processes, async (options) => {
+				await receiveCmdServerList(readPin, listWritePin, options);
+			}, optionsProc);
+
+			// Print result
+			const first = await receiveValue(listReadPin, optionsProc);
+			if (first.done) {
+				// Finish must be delayed until after read, because pipes can't be half-closed
+				await sendFinish(writePin, optionsProc);
+				return;
+			}
+
+			console.log(`Name: ${ first.value.name }`);
+			printKey(first.value.publicKey);
+
+			while (true) {
+				const result = await receiveValue(listReadPin, optionsProc);
+				if (result.done) {
+					break;
+				}
+				console.log();
+				console.log(`Name: ${ result.value.name }`);
+				printKey(result.value.publicKey);
+			}
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'show' && argv[3] === 'proxies') {
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'show_proxies',
+			}, optionsProc);
+
+			// Receive list
+			const { readPin: listReadPin, writePin: listWritePin } = createPipe<ActiveProxy>();
+
+			await sendValue(processes, async (options) => {
+				await receiveCmdProxyList(readPin, listWritePin, options);
+			}, optionsProc);
+
+			// Print result
+			const first = await receiveValue(listReadPin, optionsProc);
+			if (first.done) {
+				// Finish must be delayed until after read, because pipes can't be half-closed
+				await sendFinish(writePin, optionsProc);
+				return;
+			}
+
+			console.log(`Port: ${ first.value.port }`);
+			console.log(`Server: ${ first.value.serverName }`);
+			console.log(`Service: ${ Buffer.from(first.value.serviceName).toString() }`);
+
+			while (true) {
+				const result = await receiveValue(listReadPin, optionsProc);
+				if (result.done) {
+					break;
+				}
+				console.log();
+				console.log(`Port: ${ result.value.port }`);
+				console.log(`Server: ${ result.value.serverName }`);
+				console.log(`Service: ${ Buffer.from(result.value.serviceName).toString() }`);
+			}
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
 	if (argv[2] === 'add') {
+		let port_arg = 3;
 		if (!/^[0-9]+$/.test(argv[3])) {
-			console.log('Please specify a port');
-			console.log();
-			console.log('Usage:');
-			console.log('  add <port> <name>');
-			return;
+			if (!/^[0-9]+$/.test(argv[4])) {
+				console.log('Please specify a port');
+				console.log();
+				console.log('Usage:');
+				console.log('  add [<host>] <port> <name>');
+				return;
+			}
+			port_arg = 4;
 		}
-		const name = argv.slice(4).join(' ').trim();
+		const name = argv.slice(port_arg + 1).join(' ').trim();
 		if (name === '') {
 			console.log('Please specify a name');
 			console.log();
@@ -595,7 +877,8 @@ async function app(): Promise<void> {
 			console.log('  add <port> <name>');
 			return;
 		}
-		const port = parseInt(argv[3]);
+		const host = port_arg === 4 ? argv[3] : null;
+		const port = parseInt(argv[port_arg]);
 		const nameBuf = Buffer.from(name);
 		if (port < 1 || port > 65535) {
 			console.log('Port must be between 1 and 65535');
@@ -611,33 +894,35 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'add_service',
-					port,
-					name: nameBuf,
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, host === null ? {
+				type: 'add_service',
+				port,
+				name: nameBuf,
+			} : {
+				type: 'add_service',
+				host,
+				port,
+				name: nameBuf,
 			}, optionsProc);
 
 			// No result
 			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
 	if (argv[2] === 'remove') {
-		if (!/^[0-9]+$/.test(argv[3])) {
-			console.log('Please specify a port');
+		const name = argv.slice(3).join(' ').trim();
+		if (name === '') {
+			console.log('Please specify the name of the service');
 			console.log();
 			console.log('Usage:');
-			console.log('  add <port> <name>');
+			console.log('  remove <name>');
 			return;
 		}
-		const port = parseInt(argv[3]);
-		if (port < 1 || port > 65535) {
-			console.log('Port must be between 1 and 65535');
-			return;
-		}
+		const nameBuf = Buffer.from(name);
 
 		return await runProcesses(async (processes, optionsProc) => {
 			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
@@ -648,16 +933,16 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'remove_service',
-					port,
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'remove_service',
+				name: nameBuf,
 			}, optionsProc);
 
 			// No result
 			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
@@ -690,16 +975,16 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'add_remote',
-					publicKey,
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'add_remote',
+				publicKey,
 			}, optionsProc);
 
 			// No result
 			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
@@ -732,28 +1017,331 @@ async function app(): Promise<void> {
 			}, optionsProc);
 
 			// Send command
-			await sendValue(processes, async (options) => {
-				await sendCmdRequest(writePin, {
-					type: 'remove_remote',
-					publicKey,
-				}, options);
-				await sendFinish(writePin, optionsProc);
+			await sendCmdRequest(writePin, {
+				type: 'remove_remote',
+				publicKey,
 			}, optionsProc);
 
 			// No result
 			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'register') {
+		const name = (argv[3] ?? '').trim();
+		if (name === '') {
+			console.log('Please specify a name for the server');
+			console.log();
+			console.log('Usage:');
+			console.log('  register <name> <public key>');
+			return;
+		}
+		const pubkey_phrase = argv.slice(4).join(' ').trim();
+		if (pubkey_phrase === '') {
+			console.log('Please specify a public key as a BIP39 mnemonic phrase');
+			console.log();
+			console.log('Usage:');
+			console.log('  register <name> <public key>');
+			return;
+		}
+		let publicKey: Uint8Array;
+		try {
+			publicKey = mnemonicToEntropy(pubkey_phrase, wordlist);
+		}
+		catch (error) {
+			console.log('Not a valid BIP39 phrase:');
+			console.log(pubkey_phrase);
+			console.log(error instanceof Error ? error.message : error);
+			return;
+		}
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'add_server',
+				name,
+				publicKey,
+			}, optionsProc);
+
+			// No result
+			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'unregister') {
+		const name = argv.slice(3).join(' ').trim();
+		if (name === '') {
+			console.log('Please specify the name of the server');
+			console.log();
+			console.log('Usage:');
+			console.log('  unregister <name>');
+			return;
+		}
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'remove_server',
+				name,
+			}, optionsProc);
+
+			// No result
+			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'list') {
+		const serverName = argv.slice(3).join(' ').trim();
+		if (serverName === '') {
+			console.log('Please specify the name of the server');
+			console.log();
+			console.log('Usage:');
+			console.log('  list <server name>');
+			return;
+		}
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'list',
+				serverName,
+			}, optionsProc);
+
+			// Receive list
+			const { readPin: listReadPin, writePin: listWritePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await receiveServerServiceList(readPin, listWritePin, options);
+			}, optionsProc);
+
+			// Print result
+			while (true) {
+				const result = await receiveValue(listReadPin, optionsProc);
+				if (result.done) {
+					break;
+				}
+				console.log(`${ Buffer.from(result.value).toString() }`);
+			}
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'connect') {
+		const serverName = (argv[3] ?? '').trim();
+		if (serverName === '') {
+			console.log('Please specify the name of the server');
+			console.log();
+			console.log('Usage:');
+			console.log('  connect <server name> <service name>');
+			return;
+		}
+
+		const serviceName = argv.slice(4).join(' ').trim();
+		if (serviceName === '') {
+			console.log('Please specify the name of the service');
+			console.log();
+			console.log('Usage:');
+			console.log('  connect <server name> <service name>');
+			return;
+		}
+		const serviceNameBuf = Buffer.from(serviceName);
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'proxy',
+				serverName,
+				serviceName: serviceNameBuf,
+				port: 0,
+			}, optionsProc);
+
+			// Print result
+			const result = await receiveCmdResponse(readPin, 'proxy', optionsProc);
+			console.log(`Proxy listening on port ${ result.port }`);
+
+			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'port' && argv[4] === 'connect') {
+		if (!/^[0-9]+$/.test(argv[3])) {
+			console.log('Please specify a port');
+			console.log();
+			console.log('Usage:');
+			console.log('  port <port> connect <server name> <service name>');
+			return;
+		}
+
+		const serverName = (argv[5] ?? '').trim();
+		if (serverName === '') {
+			console.log('Please specify the name of the server');
+			console.log();
+			console.log('Usage:');
+			console.log('  port <port> connect <server name> <service name>');
+			return;
+		}
+
+		const serviceName = argv.slice(6).join(' ').trim();
+		if (serviceName === '') {
+			console.log('Please specify the name of the service');
+			console.log();
+			console.log('Usage:');
+			console.log('  port <port> connect <server name> <service name>');
+			return;
+		}
+		const serviceNameBuf = Buffer.from(serviceName);
+
+		const port = parseInt(argv[3]);
+		if (port < 1 || port > 65535) {
+			console.log('Port must be between 1 and 65535');
+			return;
+		}
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'proxy',
+				serverName,
+				serviceName: serviceNameBuf,
+				port,
+			}, optionsProc);
+
+			// Print result
+			const result = await receiveCmdResponse(readPin, 'proxy', optionsProc);
+			console.log(`Proxy listening on port ${ result.port }`);
+
+			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
+		});
+	}
+
+	if (argv[2] === 'disconnect') {
+		if (!/^[0-9]+$/.test(argv[3])) {
+			console.log('Please specify a port');
+			console.log();
+			console.log('Usage:');
+			console.log('  port <port> connect <server name> <service name>');
+			return;
+		}
+
+		const port = parseInt(argv[3]);
+		if (port < 1 || port > 65535) {
+			console.log('Port must be between 1 and 65535');
+			return;
+		}
+
+		return await runProcesses(async (processes, optionsProc) => {
+			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+
+			await sendValue(processes, async (options) => {
+				await runCommand(commandReadPin, commandWritePin, options);
+			}, optionsProc);
+
+			// Send command
+			await sendCmdRequest(writePin, {
+				type: 'unproxy',
+				port,
+			}, optionsProc);
+
+			// No result
+			await receiveStop(readPin);
+
+			// Finish must be delayed until after read, because pipes can't be half-closed
+			await sendFinish(writePin, optionsProc);
 		});
 	}
 
 	console.log('Commands:');
-	console.log('  daemon              Start the daemon and listen for connections and commands');
-	console.log('  show key            Show the public key');
-	console.log('  show services       Show the list of available services');
-	console.log('  show allowed        Show the list of allowed remote public keys');
-	console.log('  add <port> <name>   Add the specified service to the list');
-	console.log('  remove <port>       Remove the specified service from the service list');
-	console.log('  allow <public key>  Add the specified public key to the allowed list');
-	console.log('  deny <public key>   Remove the specified public key from the allowed list');
+	console.log('  daemon [noserve]');
+	console.log('    Start the daemon and listen for connections and commands');
+	console.log('    If "noserve" is specified, the daemon does not listen to client');
+	console.log('    connections, and may be used purely as a client');
+	console.log('    Note: None of the other commands will work of a daemon has not been started');
+	console.log('  show key');
+	console.log('    Show the public key');
+	console.log('  show services');
+	console.log('    Show the list of available services');
+	console.log('  show allowed');
+	console.log('    Show the list of allowed remote public keys');
+	console.log('  show servers');
+	console.log('    Show the list of registered servers');
+	console.log('  show proxies');
+	console.log('    Show the list of active proxies');
+	console.log('  add [<host>] <port> <name>');
+	console.log('    Add the specified service to the list of services offered by this server');
+	console.log('    If host is not specified, localhost is used');
+	console.log('  remove <name>');
+	console.log('    Remove the specified service from the service list');
+	console.log('  allow <public key>');
+	console.log('    Add the specified public key to the list of clients allowed to');
+	console.log('    connect to this server');
+	console.log('  deny <public key>');
+	console.log('    Remove the specified public key from the list of clients allowed to');
+	console.log('    connect to this server');
+	console.log('  register <name> <public key>');
+	console.log('    Register the specified public key as a new server');
+	console.log('  unregister <name>');
+	console.log('    Remove the specified server from the registered servers list');
+	console.log('  list <server name>');
+	console.log('    List service names of services offered by the specified server');
+	console.log('  [port <port>] connect <server name> <service name>');
+	console.log('    Connect to the specified service on the specified server and proxy');
+	console.log('    any connections to a local port to that service');
+	console.log('    If a port is not specified, a random local port is used');
+	console.log('  disconnect <port>');
+	console.log('    Disconnect a previously established connection to a server');
 }
 
 await app();

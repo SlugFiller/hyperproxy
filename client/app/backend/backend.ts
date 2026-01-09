@@ -50,9 +50,9 @@ declare global {
 
 const node = new DHT();
 
-async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWritePin<Uint8Array>, options: {
+async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWritePin<Uint8Array>, options?: {
 	abort?: Abort,
-} = {}): Promise<void> {
+}): Promise<void> {
 	const request = await receiveRPCRequest(readPin, options);
 	// One request per stream
 	await receiveStop(readPin, options);
@@ -103,7 +103,7 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 					}, optionsProc);
 
 					await sendFinish(commandWritePin, optionsProc);
-				});
+				}, options);
 			}
 			finally {
 				socket.destroy();

@@ -1,128 +1,125 @@
 import type DHT from 'hyperdht';
 import {
 	createServer,
-} from 'bare-tcp';
-import b4a from 'b4a';
-import {
-	sendServerRequest,
-} from './protocol.ts';
+} from 'node:net';
 import {
 	Abort,
-} from '../src/pin-stream/abort.ts';
+} from './pin-stream/abort.ts';
 import {
 	ChangeListener,
-} from '../src/pin-stream/change.ts';
+} from './pin-stream/change.ts';
 import {
 	createClosedWritePin,
 	createPipe,
 	sendFinish,
 	sendValue,
-} from '../src/pin-stream/pin-stream.ts';
+} from './pin-stream/pin-stream.ts';
 import {
 	processReadable,
 	processWritable,
-} from '../src/pin-stream/pin-stream-compat.ts';
+} from './pin-stream/pin-stream-compat.ts';
 import {
 	runProcesses,
-} from '../src/pin-stream/processes.ts';
+} from './pin-stream/processes.ts';
 import {
 	streamSplitter,
-} from '../src/pin-stream/stream-splitter.ts';
+} from './pin-stream/stream-splitter.ts';
 import type {
 	StreamSplitterStream,
-} from '../src/pin-stream/stream-splitter.ts';
+} from './pin-stream/stream-splitter.ts';
 import {
 	waitTimeout,
-} from '../src/pin-stream/timeout.ts';
+} from './pin-stream/timeout.ts';
 import {
 	Unrace,
-} from '../src/pin-stream/unrace.ts';
+} from './pin-stream/unrace.ts';
+import {
+	sendServerRequest,
+} from './protocol.ts';
 
-const activeProxies = new Map<string, Map<string, {
-	port: number,
-	abort: Abort,
-}>>();
-
-export async function addOrGetProxy(node: DHT, keyPair: {
-	publicKey: Uint8Array,
-	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	if (!activeProxies.has(server64)) {
-		activeProxies.set(server64, new Map());
-	}
-	const services = activeProxies.get(server64)!;
-	const prev = services.get(service64);
-	if (prev) {
-		return prev.port;
-	}
-	try {
-		const created = await createProxy(node, keyPair, serverKey, serviceName, port);
-		services.set(service64, created);
-		return created.port;
-	}
-	finally {
-		if (services.size < 1) {
-			activeProxies.delete(server64)
-		}
-	}
+export interface ActiveProxy {
+	port: number;
+	serverName: string;
+	serviceName: Uint8Array;
 }
 
-export function getProxy(serverKey: Uint8Array, serviceName: Uint8Array): number {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
-		return 0;
+interface ActiveProxyImpl extends ActiveProxy {
+	abort: Abort;
+}
+
+const activeProxiesByServer = new Map<string, Set<ActiveProxyImpl>>();
+const activeProxiesByPort = new Map<number, ActiveProxyImpl>();
+
+export async function addProxy(node: DHT, keyPair: {
+	publicKey: Uint8Array,
+	secretKey: Uint8Array,
+}, serverName: string, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
+	const proxy: ActiveProxyImpl = {
+		port,
+		serverName,
+		serviceName,
+		abort: new Abort(),
+	};
+	if (port !== 0 && activeProxiesByPort.has(port)) {
+		throw new Error(`Port ${ port } already in use by another proxy`);
 	}
-	const proxy = services.get(service64);
-	if (!proxy) {
-		return 0;
+	proxy.port = await createProxy(node, keyPair, serverKey, serviceName, port, proxy.abort);
+	if (activeProxiesByPort.has(proxy.port)) {
+		proxy.abort.abort();
+		throw new Error(`Port ${ proxy.port } already in use by another proxy`);
 	}
+	activeProxiesByPort.set(proxy.port, proxy)
+	if (!activeProxiesByServer.has(serverName)) {
+		activeProxiesByServer.set(serverName, new Set());
+	}
+	activeProxiesByServer.get(serverName)!.add(proxy);
 	return proxy.port;
 }
 
-export function removeProxy(serverKey: Uint8Array, serviceName: Uint8Array): void {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
-		return;
-	}
-	const proxy = services.get(service64);
+export function getActiveProxies(): ActiveProxy[] {
+	return [...activeProxiesByPort.values()].sort((a, b) => (a.port - b.port));
+}
+
+export function removeProxyByPort(port: number): void {
+	const proxy = activeProxiesByPort.get(port);
 	if (!proxy) {
 		return;
 	}
-	services.delete(service64);
-	if (services.size < 1) {
-		activeProxies.delete(server64)
-	}
-	proxy.abort.abort();
+	activeProxiesByPort.delete(port);
+	removeProxy(proxy);
 }
 
-export function removeAllProxies(serverKey: Uint8Array): void {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
+export function removeProxiesByServer(serverName: string): void {
+	const toRemove = activeProxiesByServer.get(serverName);
+	if (!toRemove) {
 		return;
 	}
-	for (const { abort } of services.values()) {
-		abort.abort();
+	activeProxiesByServer.delete(serverName);
+	for (const proxy of toRemove) {
+		removeProxy(proxy);
 	}
-	activeProxies.delete(server64)
+}
+
+function removeProxy(proxy: ActiveProxyImpl): void {
+	proxy.abort.abort();
+	const serverProxies = activeProxiesByServer.get(proxy.serverName);
+	if (serverProxies) {
+		serverProxies.delete(proxy);
+		if (serverProxies.size < 1) {
+			activeProxiesByServer.delete(proxy.serverName);
+		}
+	}
+	if (activeProxiesByPort.get(proxy.port) === proxy) {
+		activeProxiesByPort.delete(proxy.port);
+	}
 }
 
 async function createProxy(node: DHT, keyPair: {
 	publicKey: Uint8Array,
 	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<{
-	port: number,
-	abort: Abort,
-}> {
+}, serverKey: Uint8Array, serviceName: Uint8Array, port: number, abort: Abort): Promise<number> {
 	const { readPin: localStreamsReadPin, writePin: localStreamsWritePin } = createPipe<StreamSplitterStream>();
 	const localStreamsUnrace = new Unrace();
-	const abort = new Abort();
 
 	(async function retry() {
 		const remote = node.connect(serverKey, { keyPair });
@@ -296,10 +293,11 @@ async function createProxy(node: DHT, keyPair: {
 			server.on('error', onError);
 			server.listen(port, '127.0.0.1');
 		});
-		return {
-			port: server.address().port,
-			abort,
-		};
+		const address = server.address();
+		if (address === null || typeof address !== 'object') {
+			throw new Error('Failed to retrieve bound address for listener');
+		}
+		return address.port;
 	}
 	catch (error) {
 		// If listener failed to start, ensure the connection to the server is closed as well
