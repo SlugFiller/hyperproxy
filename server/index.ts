@@ -1,5 +1,11 @@
 import DHT from 'hyperdht';
 import {
+	scanDependencies,
+} from '@callstack/licenses/node';
+import type {
+	Types,
+} from '@callstack/licenses';
+import {
 	entropyToMnemonic,
 	mnemonicToEntropy,
 } from '@scure/bip39';
@@ -1303,6 +1309,38 @@ async function app(): Promise<void> {
 		});
 	}
 
+	if (argv[2] === 'licenses') {
+		const optionsFactory: Types.ScanPackageOptionsFactory = ({ isRoot }) => ({
+			includeDevDependencies: isRoot,
+			includeTransitiveDependencies: true,
+			includeOptionalDependencies: true,
+		});
+
+		const licenses = scanDependencies(fileURLToPath(new URL('package.json', import.meta.url)), optionsFactory);
+
+		for (const [, {
+			name,
+			version,
+			author,
+			type,
+			content,
+		}] of Object.entries(licenses)) {
+			console.log();
+			console.log('Package:', name);
+			console.log('Version:', version);
+			if (author) {
+				console.log('Author:', author);
+			}
+			console.log('License:', type);
+			if (content) {
+				console.log('License text:');
+				console.log(content);
+			}
+		}
+
+		return;
+	}
+
 	console.log('Commands:');
 	console.log('  daemon [noserve]');
 	console.log('    Start the daemon and listen for connections and commands');
@@ -1342,6 +1380,8 @@ async function app(): Promise<void> {
 	console.log('    If a port is not specified, a random local port is used');
 	console.log('  disconnect <port>');
 	console.log('    Disconnect a previously established connection to a server');
+	console.log('  licenses');
+	console.log('    Display licenses of libraries used in this software');
 }
 
 await app();

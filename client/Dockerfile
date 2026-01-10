@@ -97,6 +97,8 @@ RUN npx tsc --noEmit
 
 RUN npm run lint
 
+RUN node license-generator.mts
+
 WORKDIR /usr/src/app/android
 
 RUN ./gradlew --build-cache --no-daemon assembleRelease

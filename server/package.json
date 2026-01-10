@@ -2,6 +2,7 @@
 	"type": "module",
 	"dependencies": {
 		"hyperdht": "latest",
+		"@callstack/licenses": "latest",
 		"@scure/bip39": "latest",
 		"@types/b4a": "latest"
 	}

@@ -45,6 +45,12 @@ import type {
 	ViewStyle,
 } from 'react-native';
 import {
+	ReactNativeLegal,
+} from 'react-native-legal';
+import type {
+	Library,
+} from 'react-native-legal';
+import {
 	enableSimpleNullHandling,
 	open,
 } from 'react-native-nitro-sqlite';
@@ -150,6 +156,9 @@ const AppContent: FC = () => {
 		}
 		| {
 			view: 'key',
+		}
+		| {
+			view: 'licenses',
 		}
 		| {
 			view: 'show',
@@ -462,6 +471,9 @@ const AppContent: FC = () => {
 						case 'key': return (
 							<KeyView keyPair={keyPair} />
 						);
+						case 'licenses': return (
+							<LicensesView />
+						);
 						case 'show': return (<>
 							<View style={styles.editNameContainer}>
 								<Text style={styles.serverNameLabel}>Server name:</Text>
@@ -521,6 +533,14 @@ const AppContent: FC = () => {
 						<TextButton
 							title="Show my key"
 							onPress={() => setSelectedView({ view: 'key' })}
+							style={styles.button}
+							stylePressed={styles.buttonPressed}
+							styleText={styles.buttonText}
+							stylePressedText={styles.buttonPressedText}
+						/>
+						<TextButton
+							title="Licenses"
+							onPress={() => setSelectedView({ view: 'licenses' })}
 							style={styles.button}
 							stylePressed={styles.buttonPressed}
 							styleText={styles.buttonText}
@@ -618,6 +638,52 @@ const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
 		);
 	}
 };
+
+const LicensesView: FC = () => {
+	const [libraries, setLibraries] = useState<Library[]>([]);
+
+	useEffect(() => {
+		let active = true;
+		(async () => {
+			const result = await ReactNativeLegal.getLibrariesAsync();
+			if (!active) {
+				return;
+			}
+			setLibraries(result.data);
+		})().catch((error: unknown) => {
+			if (!active) {
+				return;
+			}
+			error instanceof Error && Toast.error(error.message);
+		});
+		return () => {
+			active = false;
+		};
+	}, []);
+
+	return (
+		<View style={styles.container}>
+			<FlatList
+				data={libraries}
+				keyExtractor={({ id }: Library) => id}
+				renderItem={({ item }: { item: Library }) => (
+					<View style={styles.licenseContainer}>
+						<Text style={styles.licensePackage}>{item.name}</Text>
+						{item.developers && [...item.developers.matchAll(/Developer\(name=(.*?), organisationUrl=.*?\)/g)].map((developerMatch) => developerMatch[1] !== '' && (
+							<Text style={styles.licenseAuthor}>Author: {developerMatch[1]}</Text>
+						))}
+						{item.licenses.map((license) => (<>
+							{license.name && (
+								<Text style={styles.licenseType}>License: {license.name}</Text>
+							)}
+							<Text style={styles.licenseContent}>{license.licenseContent}</Text>
+						</>))}
+					</View>
+				)}
+			/>
+		</View>
+	);
+}
 
 interface ServerListProps {
 	onSelect?: (name: string, key: Uint8Array) => void;
@@ -1484,6 +1550,24 @@ const styles = StyleSheet.create({
 	autoCompleteItem: {
 		fontSize: 15,
 		padding: 5,
+	},
+	licenseContainer: {
+		padding: 10,
+	},
+	licensePackage: {
+		fontSize: 24,
+		fontWeight: 'bold',
+		marginBottom: 5,
+	},
+	licenseAuthor: {
+		fontSize: 20,
+		marginBottom: 5,
+	},
+	licenseType: {
+		fontSize: 20,
+		marginBottom: 5,
+	},
+	licenseContent: {
 	},
 });
 
