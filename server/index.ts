@@ -612,7 +612,11 @@ async function daemon(noServe: boolean): Promise<void> {
 		});
 	});
 
-	cmd.listen(CMD_PATH);
+	cmd.listen({
+		path: CMD_PATH,
+		readableAll: true,
+		writableAll: true,
+	});
 }
 
 async function runCommand(input: PipeReadPin<Uint8Array>, output: PipeWritePin<Uint8Array>, options?: {
