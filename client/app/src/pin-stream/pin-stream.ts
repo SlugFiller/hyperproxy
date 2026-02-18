@@ -308,7 +308,7 @@ export async function waitUntilCanSend<T>(output: PipeWritePin<T>, options: {
 // Waits for `output` to reach `wants_value` state and then writes the value
 // Returns `true` if the value has been written
 // If `output` is in `no_more` state, if `throwOnNoMore` is `true` then throws, otherwise returns `false`
-// If `waitConsume` is `true`, waits after sending until `output` trsnsitions away from `has_value`
+// If `waitConsume` is `true`, waits after sending until `output` transitions away from `has_value`
 // Throws if `output` is already in `finished` state
 // Throws if `abort` is aborted
 export async function sendValue<T>(output: PipeWritePin<T>, value: T, options: {
@@ -395,7 +395,7 @@ export async function sendValue<T>(output: PipeWritePin<T>, value: T, options: {
 // Waits for `output` to reach `wants_value` state and then transitions
 // Returns `true` if the transition was successful
 // If `output` is in `no_more` state, if `throwOnNoMore` is `true` then throws, otherwise returns `false`
-// If `waitConsume` is `true`, waits after sending until `output` trsnsitions away from `finished`
+// If `waitConsume` is not `false`, waits after finishing until `output` transitions away from `finished`
 // Returns `true` if `output` is already in `finished` state
 // Throws if `abort` is aborted
 export async function sendFinish<T>(output: PipeWritePin<T>, options: {
@@ -406,7 +406,7 @@ export async function sendFinish<T>(output: PipeWritePin<T>, options: {
 	const {
 		abort,
 		throwOnNoMore = false,
-		waitConsume = false,
+		waitConsume = true,
 	} = options;
 	while (true) {
 		const listener = new ChangeListener(output.changeRoot);
@@ -580,6 +580,7 @@ export async function receiveValue<T, const O extends {
 // Returns `true` if the transition was successful
 // If `input` is in `has_value` state, consumes the value if `consumeValue` is `consume` (default), throws if `consumeValue` is `throw`. otherwise returns `false`
 // Automatically acknowledges a finish if `consumeFinish` is not `false`. Otherwise `input.gotFinish` must be manually called
+// If `waitConsume` is not `false`, waits after stopping until `input` transitions away from `no_more`
 // If `input` is in `finished` state, if `throwOnFinished` is `true` then throws, otherwise returns `false`
 // Retuns true `input` is already in `no_more` state
 // Throws if `abort` is aborted
@@ -588,12 +589,14 @@ export async function receiveStop<T>(input: PipeReadPin<T>, options: {
 	consumeValue?: 'consume' | 'throw' | 'retain',
 	consumeFinish?: boolean,
 	throwOnFinished?: boolean,
+	waitConsume?: boolean,
 } = {}): Promise<boolean> {
 	const {
 		abort,
 		consumeValue = 'consume',
 		consumeFinish = true,
 		throwOnFinished = false,
+		waitConsume = true,
 	} = options;
 	while (true) {
 		const listener = new ChangeListener(input.changeRoot);
@@ -610,6 +613,9 @@ export async function receiveStop<T>(input: PipeReadPin<T>, options: {
 
 			if (state.state === 'idle') {
 				input.noMore();
+				if (waitConsume) {
+					break;
+				}
 				return true;
 			}
 
@@ -625,6 +631,9 @@ export async function receiveStop<T>(input: PipeReadPin<T>, options: {
 			}
 
 			if (state.state === 'no_more') {
+				if (waitConsume) {
+					break;
+				}
 				return true;
 			}
 
@@ -639,6 +648,31 @@ export async function receiveStop<T>(input: PipeReadPin<T>, options: {
 			}
 
 			// Wait for input to have data
+			await listener.changed;
+		}
+		finally {
+			// Ensure cleanup from all change roots
+			listener.change();
+		}
+	}
+	while (true) {
+		const listener = new ChangeListener(input.changeRoot);
+
+		try {
+			if (abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					throw abort.reason;
+				}
+			}
+
+			const state = input.state;
+
+			if (state.state !== 'no_more') {
+				return true;
+			}
+
+			// Wait for value to be consumed
 			await listener.changed;
 		}
 		finally {
