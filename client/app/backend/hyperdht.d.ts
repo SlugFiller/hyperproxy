@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -14,7 +16,7 @@
  */
 
 declare module 'hyperdht' {
-	import type {
+	import {
 		Duplex,
 	} from 'bare-stream';
 	import {
@@ -25,8 +27,7 @@ declare module 'hyperdht' {
 		onconnection: [socket: Duplex];
 	}
 
-	interface HandshakePayload {
-	}
+	type HandshakePayload = object;
 
 	interface HandshakeResult {
 		isInitiator: boolean;
@@ -91,8 +92,7 @@ declare module 'hyperdht' {
 		reusableSocket?: boolean;
 	}
 
-	interface AnnouncerOptions {
-	}
+	type AnnouncerOptions = object;
 
 	interface ConnectOptions {
 		pool?: null | Map<string, Duplex>;
@@ -112,6 +112,7 @@ declare module 'hyperdht' {
 
 	class Server extends EventEmitter<ServerEvents> {
 		listen(keyPair: KeyPair, opts?: AnnouncerOptions);
+		close(): Promise<void>;
 	}
 
 	class HyperDHT {

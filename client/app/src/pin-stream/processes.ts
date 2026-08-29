@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -19,210 +21,233 @@ import {
 import {
 	ChangeListener,
 } from './change.ts';
-import {
-	createPipe,
-} from './pin-stream.ts';
-import type {
-	PipeWritePin,
-} from './pin-stream.ts';
 
-// Runs until `main` and every process written to `processes` has settled, either succesfully or with error
-// Passes to each an `Abort` that aborts if:
-// - The passed `abort` has aborted
-// - Any of the passed `aborts` has aborted
-// - `main` settled with an error
-// - Any of the processes written to `processes` has thrown
-// Returns the value returned from `main` so long as none of the above conditions occurred,
-// otherwise, throws the first error or reason corresponding to the above
-// If `main` exits before `processes` reaches the `finished` state, it is transitioned into the `no_more` state
-// `maxConcurrent`, if specified, is the maximal number of processes that may run concurrently
-// No additional processes will be read from `processes` if the max concurrent processes are reached
-export async function runProcesses<T>(main: (processes: PipeWritePin<(options?: {
-	abort?: Abort,
-}) => Promise<void>>, options?: {
-	abort?: Abort,
-}) => Promise<T>, options: {
-	abort?: Abort,
-	aborts?: (Abort | undefined)[],
-	maxConcurrent?: number,
-} = {}): Promise<T> {
-	const {
-		abort,
-		aborts,
-		maxConcurrent = 0,
-	} = options;
+/**
+ * Manages multiple processes running in parallel. Exposes `writePin`,
+ * to which processes can be written.
+ *
+ * Example usage:
+ * ```typescript
+ * await using processes = new Processes({ abort: parentAbort });
+ *
+ * const { writePin, abort } = processes;
+ *
+ * sendValue(writePin, async () => {
+ * 	await doSomeAction1({ abort });
+ * }, { abort });
+ *
+ * sendValue(writePin, async () => {
+ * 	await doSomeAction2({ abort });
+ * }, { abort });
+ *
+ * await doSomeAction3({ abort });
+ *
+ * // doSomeAction1, doSomeAction2, doSomeAction3 all run in parallel
+ *
+ * // Wait for doSomeAction1 and doSomeAction2 to complete
+ * await processes.finish();
+ * ```
+ */
+export class Processes {
+	#stack?: string;
+	#abort: Abort;
+	#changeRoot: ChangeListener;
+	#runningProcesses: number;
+	#runningAbortMerge: boolean;
 
-	const { readPin, writePin } = createPipe<(options?: {
+	/**
+	 * If any {@link Abort}s are provided in the options, starts a background process that
+	 * delivers an abort on these to {@link Processes.abort}.
+	 *
+	 * @param [options] - Initialization options.
+	 * @param [options.abort] - If aborted, all processes are aborted.
+	 * @param [options.aborts] - All process are aborted if any of the supplied {@link Abort}s are aborted.
+	 *                           Allows merging abort signals.
+	 */
+	constructor(options: {
 		abort?: Abort,
-	}) => Promise<void>>();
-	const mainAbort = new Abort();
-	let mainFinished = false;
-	const mainFinishedChange = new ChangeListener();
-	let readerFinished = false;
-	let runningProcesses = 0;
-	const processChange = new ChangeListener();
-	const maxProcessChange = new ChangeListener();
+		aborts?: (Abort | undefined)[],
+	} = {}) {
+		// Capture the stack here and not in `run`, because Processes has a scope-bound
+		// lifecycle, while a process started with `run` is fire-and-forget and could easily
+		// outlive its calling stack
+		this.#stack = new Error('Thrown from process').stack;
+		this.#abort = new Abort();
+		this.#changeRoot = new ChangeListener();
+		this.#runningProcesses = 0;
+		this.#runningAbortMerge = false;
+		if (options.abort || options.aborts) {
+			// This process needs to be counted separately from the other process
+			// so that it doesn't block the processes finishing
+			this.#runningAbortMerge = true;
+			this.#abortMerge(options).then(() => {
+				this.#runningAbortMerge = false;
+				if (this.#runningProcesses <= 0) {
+					// Inform possible all-settled
+					this.#changeRoot.change();
+				}
+			}).catch((error: unknown) => {
+				// This should be unreachable. Handle it anyway
+				if (!this.#abort.aborted) {
+					const deliverError = new Error('Thrown abort merge', { cause: error });
+					deliverError.stack = this.#stack;
+					this.#abort.abort(deliverError);
+				}
+				this.#runningAbortMerge = false;
+				if (this.#runningProcesses <= 0) {
+					// Inform possible all-settled
+					this.#changeRoot.change();
+				}
+			});
+		}
+	}
 
-	const [ret] = await Promise.allSettled([
-		(async () => {
-			// Spawn main
-			try {
-				return await main(writePin, {
-					abort: mainAbort,
-				});
+	/**
+	 * An {@link Abort} that aborts if:
+	 * - Any of the processes have thrown.
+	 * - The instance of this class went out of scope.
+	 * - Any of the {@link Abort}s passed to the constructor have aborted.
+	 */
+	get abort(): Abort {
+		return this.#abort;
+	}
+
+	/**
+	 * Access property to allow testing the current status of this {@link Processes} without blocking.
+	 *
+	 * @returns `true` if and only if no processes are running currently.
+	 */
+	get finished(): boolean {
+		return this.#runningProcesses <= 0;
+	}
+
+	/**
+	 * Starts a new process.
+	 *
+	 * @param process - The process to run. Runs in parallel with any existing processes
+	 */
+	run(process: () => Promise<void>): void {
+		if (this.#abort.aborted) {
+			throw this.#abort.reason;
+		}
+		this.#runningProcesses++;
+		process().then(() => {
+			this.#runningProcesses--;
+			if (this.#runningProcesses <= 0) {
+				// Inform possible all-settled
+				this.#changeRoot.change();
 			}
-			catch (error) {
-				mainAbort.abort(error);
-				throw error;
+		}).catch((error: unknown) => {
+			if (!this.#abort.aborted) {
+				const deliverError = new Error('Thrown from process', { cause: error });
+				deliverError.stack = this.#stack;
+				this.#abort.abort(deliverError);
 			}
-			finally {
-				mainFinished = true;
-				mainFinishedChange.change();
-				// Also need to inform the process waiter
-				processChange.change();
+			this.#runningProcesses--;
+			if (this.#runningProcesses <= 0) {
+				// Inform possible all-settled
+				this.#changeRoot.change();
 			}
-		})(),
-		(async () => {
-			// Read pipe and spawn processes
-			try {
-				while (true) {
-					const listener = new ChangeListener(readPin.changeRoot);
+		});
+	}
 
-					try {
-						if (!mainFinished) {
-							listener.addRoot(mainFinishedChange);
-						}
+	/**
+	 * Waits for all currently running processes to complete.
+	 * It is still possible to use this instance after this function returns.
+	 *
+	 * Throws without waiting for the processes if:
+	 * - Any of the processes have thrown.
+	 * - `abort` is aborted.
+	 * - Any of the {@link Abort}s passed to the constructor have aborted.
+	 * - The instance of this class went out of scope. Normally, this method should be called from
+	 *   inside the same scope.
+	 *
+	 * @param [options] - Additional options.
+	 * @param [options.abort] - If aborted, stops waiting for all processes to finish and throws.
+	 */
+	async finish(options: {
+		abort?: Abort,
+	} = {}): Promise<void> {
+		const {
+			abort,
+		} = options;
+		while (true) {
+			using listener = new ChangeListener(this.#changeRoot);
 
-						const state = readPin.state;
+			if (abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					throw abort.reason;
+				}
+			}
 
-						if (state.state === 'idle') {
-							if (mainFinished) {
-								readPin.noMore();
-								break;
-							}
-							if (maxConcurrent > 0 && runningProcesses >= maxConcurrent) {
-								// Can't read any more processes
-								// Wait until more room is free
-								listener.addRoot(maxProcessChange);
-								await listener.changed;
-								continue;
-							}
-							readPin.wantsValue();
-							continue;
-						}
+			listener.addRoot(this.#abort.changeRoot);
+			if (this.#abort.aborted) {
+				throw this.#abort.reason;
+			}
 
-						if (state.state === 'has_value') {
-							readPin.gotValue();
-							runningProcesses++;
-							state.value({
-								abort: mainAbort,
-							}).then(() => {
-								runningProcesses--;
-								if (runningProcesses < 1) {
-									// Inform possible all-settled
-									processChange.change();
-								}
-								if (maxConcurrent > 0 && runningProcesses === maxConcurrent - 1) {
-									// Possible room for more processes
-									maxProcessChange.change();
-								}
-							}).catch((error) => {
-								mainAbort.abort(error);
-								runningProcesses--;
-								if (runningProcesses < 1) {
-									// Inform possible all-settled
-									processChange.change();
-								}
-								if (maxConcurrent > 0 && runningProcesses === maxConcurrent - 1) {
-									// Possible room for more processes
-									maxProcessChange.change();
-								}
-							});
-							continue;
-						}
+			if (this.#runningProcesses <= 0) {
+				break;
+			}
 
-						if (state.state !== 'wants_value') {
-							if (state.state === 'finished') {
-								readPin.gotFinish();
-							}
-							// No more processes
+			await listener.changed;
+		}
+	}
+
+	/**
+	 * Enables using this class in `using` syntax. Aborts any still running processes, and waits
+	 * for all processes to finish. If any process ended in error before or after reaching this
+	 * point, that error will be discarded.
+	 */
+	async [Symbol.asyncDispose](): Promise<void> {
+		this.#abort.abort(new Error('Processes left scope'));
+		while (true) {
+			using listener = new ChangeListener(this.#changeRoot);
+			if (!this.#runningAbortMerge && this.#runningProcesses <= 0) {
+				break;
+			}
+			await listener.changed;
+		}
+	}
+
+	async #abortMerge(options: {
+		abort?: Abort,
+		aborts?: (Abort | undefined)[],
+	} = {}): Promise<void> {
+		const {
+			abort,
+			aborts,
+		} = options;
+
+		// Allow other aborts to be delivered to the main abort
+		while (true) {
+			using listener = new ChangeListener(this.#changeRoot);
+
+			listener.addRoot(this.#abort.changeRoot);
+
+			if (!this.#abort.aborted && abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					this.#abort.abort(abort.reason);
+				}
+			}
+			if (!this.#abort.aborted && aborts) {
+				for (const eachAbort of aborts) {
+					if (eachAbort) {
+						listener.addRoot(eachAbort.changeRoot);
+						if (eachAbort.aborted) {
+							this.#abort.abort(eachAbort.reason);
 							break;
 						}
-
-						if (mainFinished) {
-							// No writer. Write a dummy value so that we can transition to `no_more`
-							writePin.setValue(() => Promise.resolve());
-							continue;
-						}
-
-						await listener.changed;
-					}
-					finally {
-						// Ensure cleanup from all change roots
-						listener.change();
 					}
 				}
 			}
-			finally {
-				// Done reading
-				readerFinished = true;
-				processChange.change();
+
+			if (this.#abort.aborted) {
+				break;
 			}
-		})(),
-		(async () => {
-			// Wait for main and all processes to settle
-			// Also handle delivering abort while processes or main are running
-			let aborted = false;
-			while (true) {
-				const listener = new ChangeListener(processChange);
 
-				try {
-					if (!aborted) {
-						if (abort) {
-							listener.addRoot(abort.changeRoot);
-							if (abort.aborted) {
-								mainAbort.abort(abort.reason);
-								// Abort was delivered, we can stop caring about it
-								aborted = true;
-								continue;
-							}
-						}
-						if (aborts) {
-							for (const eachAbort of aborts) {
-								if (eachAbort) {
-									listener.addRoot(eachAbort.changeRoot);
-									if (eachAbort.aborted) {
-										mainAbort.abort(eachAbort.reason);
-										// Abort was delivered, we can stop caring about it
-										aborted = true;
-										continue;
-									}
-								}
-							}
-						}
-					}
-
-					if (readerFinished && mainFinished && runningProcesses < 1) {
-						// All processes settled, and no more processes can be spawned
-						break;
-					}
-
-					await listener.changed;
-				}
-				finally {
-					// Ensure cleanup from all change roots
-					listener.change();
-				}
-			}
-		})(),
-	]);
-
-	if (mainAbort.aborted) {
-		throw mainAbort.reason;
+			await listener.changed;
+		}
 	}
-
-	if (ret.status === 'rejected') {
-		throw ret.reason;
-	}
-	return ret.value;
 }

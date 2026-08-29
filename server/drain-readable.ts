@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,8 +15,8 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from './pin-stream/abort.ts';
 import {
 	ChangeListener,

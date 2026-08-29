@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,22 +15,18 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from '../src/pin-stream/abort.ts';
 import {
+	type PipeReadPin,
+	type PipeWritePin,
 	sendValue,
 } from '../src/pin-stream/pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
-} from '../src/pin-stream/pin-stream.ts';
 import {
+	type PacketProcessResult,
 	decodePacketStream,
 	readPacket,
-} from '../src/pin-stream/transform.ts';
-import type {
-	PacketProcessResult,
 } from '../src/pin-stream/transform.ts';
 
 export type RPCRequestPacket = {

@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -14,10 +16,8 @@
  */
 
 import {
+	type TurboModule,
 	TurboModuleRegistry,
-} from 'react-native';
-import type {
-	TurboModule,
 } from 'react-native';
 
 export interface Spec extends TurboModule {

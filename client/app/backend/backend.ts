@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,15 +15,12 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Duplex,
+import {
+	type Duplex,
 } from 'bare-stream';
 import DHT from 'hyperdht';
 import {
-	addOrGetProxy,
-	getProxy,
-	removeProxy,
-	removeAllProxies,
+	ProxyManager,
 } from './proxy-manager.ts';
 import {
 	receiveRPCRequest,
@@ -32,29 +31,26 @@ import {
 	Abort,
 } from '../src/pin-stream/abort.ts';
 import {
+	toAsyncIterable,
+} from '../src/pin-stream/iterable.ts';
+import {
+	type PipeReadPin,
+	type PipeWritePin,
 	createClosedReadPin,
 	createPipe,
 	receiveStop,
-	receiveValue,
 	sendFinish,
-	sendValue,
-} from '../src/pin-stream/pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
 } from '../src/pin-stream/pin-stream.ts';
 import {
 	processReadable,
 	processWritable,
 } from '../src/pin-stream/pin-stream-compat.ts';
 import {
-	runProcesses,
+	Processes,
 } from '../src/pin-stream/processes.ts';
 import {
+	type StreamSplitterStream,
 	streamSplitter,
-} from '../src/pin-stream/stream-splitter.ts';
-import type {
-	StreamSplitterStream,
 } from '../src/pin-stream/stream-splitter.ts';
 
 declare global {
@@ -63,9 +59,17 @@ declare global {
 	}
 }
 
-const node = new DHT();
+using kitStack = new DisposableStack();
+kitStack.adopt(BareKit.IPC, (r) => {
+	r.destroy();
+})
 
-async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWritePin<Uint8Array>, options?: {
+await using nodeStack = new AsyncDisposableStack();
+const node = nodeStack.adopt(new DHT(), async (r) => {
+	await r.destroy();
+});
+
+async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWritePin<Uint8Array>, proxyManager: ProxyManager, options?: {
 	abort?: Abort,
 }): Promise<void> {
 	const request = await receiveRPCRequest(readPin, options);
@@ -84,14 +88,19 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 		}
 
 		case 'list': {
-			const { readPin: commandReadPin, writePin: commandWritePin } = createPipe<Uint8Array>();
+			const { writePin: commandWritePin, readPin: socketInput } = createPipe<Uint8Array>();
+			// Stream the result directly to the write pin
+			const socketOutput = writePin;
 
 			// Connect to server
-			const socket = node.connect(request.serverKey, {
+			using socketStack = new DisposableStack();
+			const socket = socketStack.adopt(node.connect(request.serverKey, {
 				keyPair: {
 					publicKey: request.publicKey,
 					secretKey: request.secretKey,
 				},
+			}), (r) => {
+				r.destroy();
 			});
 			socket.on('error', (error: unknown) => {
 				// The default behavior for `EventEmitter` is to crash the VM if an error
@@ -99,37 +108,31 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 				console.log('Request socket error', error);
 			});
 
-			try {
-				await runProcesses(async (processes, optionsProc) => {
-					await sendValue(processes, async (optionsSub) => {
-						// Stream the result directly to the write pin
-						await processReadable(socket, writePin, optionsSub);
-					}, optionsProc);
+			await using processes = new Processes(options);
 
-					await sendValue(processes, async (optionsSub) => {
-						await processWritable(commandReadPin, socket, optionsSub);
-					}, optionsProc);
+			processes.run(async () => {
+				await processReadable(socket, socketOutput, { abort: processes.abort });
+			});
 
-					await sendFinish(processes, optionsProc);
+			processes.run(async () => {
+				await processWritable(socketInput, socket, { abort: processes.abort });
+			});
 
-					// Send the request packet
-					await sendServerRequest(commandWritePin, {
-						type: 'list',
-					}, optionsProc);
+			// Send the request packet
+			await sendServerRequest(commandWritePin, {
+				type: 'list',
+			}, { abort: processes.abort });
 
-					await sendFinish(commandWritePin, optionsProc);
-				}, options);
-			}
-			finally {
-				socket.destroy();
-			}
+			await sendFinish(commandWritePin, { abort: processes.abort });
+
+			await processes.finish();
 			break;
 		}
 
 		case 'proxy': {
 			await sendRPCResponse(writePin, {
 				type: 'proxy',
-				port: await addOrGetProxy(node, {
+				port: await proxyManager.addOrGetProxy(node, {
 					publicKey: request.publicKey,
 					secretKey: request.secretKey,
 				}, request.serverKey, request.serviceName, request.port),
@@ -139,7 +142,7 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 		}
 
 		case 'unproxy': {
-			removeProxy(request.serverKey, request.serviceName);
+			proxyManager.removeProxy(request.serverKey, request.serviceName);
 			await sendFinish(writePin, options);
 			break;
 		}
@@ -147,14 +150,14 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 		case 'is_proxy': {
 			await sendRPCResponse(writePin, {
 				type: 'is_proxy',
-				port: getProxy(request.serverKey, request.serviceName),
+				port: proxyManager.getProxy(request.serverKey, request.serviceName),
 			});
 			await sendFinish(writePin, options);
 			break;
 		}
 
 		case 'unproxy_all': {
-			removeAllProxies(request.serverKey);
+			proxyManager.removeAllProxies(request.serverKey);
 			await sendFinish(writePin, options);
 			break;
 		}
@@ -162,69 +165,55 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 }
 
 try {
-	await runProcesses(async (processes, optionsProc) => {
-		const { readPin, writePin: joinedOutput } = createPipe<Uint8Array>();
-		const { readPin: joinedInput, writePin } = createPipe<Uint8Array>();
-		const { readPin: remoteStreamsReadPin, writePin: remoteStreamsWritePin } = createPipe<StreamSplitterStream>();
+	await using proxyManager = new ProxyManager();
+	await using processes = new Processes();
 
-		await sendValue(processes, async (options) => {
-			await processReadable(BareKit.IPC, writePin, options);
-		}, optionsProc);
+	const { writePin: joinedOutput, readPin } = createPipe<Uint8Array>();
+	const { writePin, readPin: joinedInput } = createPipe<Uint8Array>();
+	const remoteStreams = createPipe<StreamSplitterStream>();
 
-		await sendValue(processes, async (options) => {
-			await processWritable(readPin, BareKit.IPC, options);
-		}, optionsProc);
-
-		await sendValue(processes, async (options) => {
-			await streamSplitter(joinedInput, joinedOutput, createClosedReadPin<StreamSplitterStream>(), remoteStreamsWritePin, options);
-		}, optionsProc);
-
-		while (true) {
-			const result = await receiveValue(remoteStreamsReadPin, optionsProc);
-			if (result.done) {
-				break;
-			}
-
-			const {
-				readPin: requestReadPin,
-				writePin: requestWritePin,
-				localAbort,
-				remoteAbort,
-			} = result.value;
-
-			await sendValue(processes, async () => {
-				try {
-					await runProcesses(async (unused, optionsConn) => {
-						// Not using processes spawning context
-						// Only running this to combine aborts
-						await sendFinish(unused, optionsConn);
-
-						await handleRequest(requestReadPin, requestWritePin, optionsConn);
-					}, {
-						abort: optionsProc?.abort,
-						aborts: [
-							// Also abort on remote abort
-							remoteAbort,
-						],
-					});
-				}
-				catch (error) {
-					console.log(error);
-					localAbort?.abort(error);
-				}
-				finally {
-					localAbort?.abort();
-				}
-			}, optionsProc);
-		}
-
-		await sendFinish(processes, optionsProc);
+	processes.run(async () => {
+		await processReadable(BareKit.IPC, writePin, { abort: processes.abort });
 	});
+
+	processes.run(async () => {
+		await processWritable(readPin, BareKit.IPC, { abort: processes.abort });
+	});
+
+	processes.run(async () => {
+		await streamSplitter(joinedInput, joinedOutput, createClosedReadPin<StreamSplitterStream>(), remoteStreams.writePin, { abort: processes.abort });
+	});
+
+	for await (const {
+		readPin: requestReadPin,
+		writePin: requestWritePin,
+		localAbort,
+		remoteAbort,
+	} of toAsyncIterable(remoteStreams.readPin, { abort: processes.abort })) {
+		processes.run(async () => {
+			try {
+				await using processesConn = new Processes({
+					aborts: [
+						processes.abort,
+						// Also abort on remote abort
+						remoteAbort,
+					],
+				});
+
+				await handleRequest(requestReadPin, requestWritePin, proxyManager, { abort: processesConn.abort });
+			}
+			catch (error) {
+				console.log(error);
+				localAbort?.abort(error);
+			}
+			finally {
+				localAbort?.abort();
+			}
+		});
+	}
+
+	await processes.finish();
 }
 catch (e) {
 	console.log(e);
-}
-finally {
-	BareKit.IPC.destroy();
-	await node.destroy();
 }

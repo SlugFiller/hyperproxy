@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,15 +15,15 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from './abort.ts';
 import {
 	ChangeListener,
 } from './change.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
+import {
+	type PipeReadPin,
+	type PipeWritePin,
 } from './pin-stream.ts';
 
 interface ReadableLike {
@@ -35,7 +37,7 @@ interface ReadableLike {
 	off(event: 'close', cb: () => void): void;
 	read(): unknown;
 	destroy(reason?: unknown): void;
-};
+}
 
 interface WritableLike {
 	on(event: 'drain', cb: () => void): void;
@@ -47,16 +49,23 @@ interface WritableLike {
 	off(event: 'error', cb: (error?: unknown) => void): void;
 	off(event: 'close', cb: () => void): void;
 	write(value: unknown): boolean;
-	end(): void;
+	end(data: unknown): void;
 	destroy(reason?: unknown): void;
-};
+}
 
-// Reads from `readable` and writes the read packets to `output`
-// Does not perform any reading until `output` is in `wants_value` state
-// Throws if `abort` is aborted or if `readable` emits an error
-// Destroys `readable` in case of an abort
-// Transitions `output` to `finished` state when reading from `readable` ends or `readable` is destroyed without error
-// Returns once `output` is either in `finished` or `no_more` states
+/**
+ * Reads from `readable` and writes the read packets to `output`.
+ * Does not perform any reading until `output` is in `wants_value` state.
+ * Throws if `abort` is aborted or if `readable` emits an error.
+ * Destroys `readable` in case of an abort.
+ * Transitions `output` to `finished` state when reading from `readable` ends or `readable` is destroyed without error.
+ * Returns once `output` is either in `finished` or `no_more` states.
+ *
+ * @param readable - Input stream from which data is read.
+ * @param output - Output stream to which data is written.
+ * @param [options] - Additional options.
+ * @param [options.abort] - If aborted, stops processing and throws.
+ */
 export async function processReadable<T>(readable: ReadableLike, output: PipeWritePin<T>, options: {
 	abort?: Abort,
 } = {}): Promise<void> {
@@ -91,58 +100,52 @@ export async function processReadable<T>(readable: ReadableLike, output: PipeWri
 	readable.on('close', onClose);
 	try {
 		while (true) {
-			const listener = new ChangeListener(output.changeRoot);
-			try {
-				listener.addRoot(readableChangeRoot);
-				if (abort) {
-					listener.addRoot(abort.changeRoot);
-					if (abort.aborted) {
-						throw abort.reason;
-					}
+			using listener = new ChangeListener(output.changeRoot);
+			listener.addRoot(readableChangeRoot);
+			if (abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					throw abort.reason;
 				}
-				const state = output.state;
-				if (readableHasError) {
-					// Forward errors from the readable regardless of the state of the output pin
-					throw readableError;
+			}
+			const state = output.state;
+			if (readableHasError) {
+				// Forward errors from the readable regardless of the state of the output pin
+				throw readableError;
+			}
+			if (readableHasClose && !readableHasEnd) {
+				// Stream has been unexpectedly destroyed without error. Stop here
+				break;
+			}
+			if (state.state === 'wants_value') {
+				// Check if we can read from readable
+				const chunk = readable.read() as T;	// We assume the readable produces T objects
+				if (chunk !== null) {
+					// Write the chunk to output
+					output.setValue(chunk);
+					continue;	// Continue reading
 				}
-				if (readableHasClose && !readableHasEnd) {
-					// Stream has been unexpectedly destroyed without error. Stop here
+				if (readableHasEnd) {
+					// Finished reading
+					output.finish();
 					break;
 				}
-				if (state.state === 'wants_value') {
-					// Check if we can read from readable
-					const chunk = readable.read() as T;	// We assume the readable produces T objects
-					if (chunk !== null) {
-						// Write the chunk to output
-						output.setValue(chunk);
-						continue;	// Continue reading
-					}
-					if (readableHasEnd) {
-						// Finished reading
-						output.finish();
-						break;
-					}
-				}
-				if (state.state === 'finished' || state.state === 'finished_ack') {
-					// The output transitioned to a `finished` state, and we didn't do it
-					throw new Error('Unexpected output state finished');
-				}
-				if (state.state === 'no_more' || state.state === 'no_more_ack') {
-					if (state.state === 'no_more') {
-						output.gotNoMore();
-					}
-					// Unfortunately, if the readable is part of a Duplex like a socket, there
-					// is no safe way to indicate we don't want any more data without potentially
-					// stopping the writable end as well
-					break;
-				}
-				// Wait for abort, or state change in the output pin, or state change in the readable
-				await listener.changed;
 			}
-			finally {
-				// Ensure cleanup from all change roots
-				listener.change();
+			if (state.state === 'finished' || state.state === 'finished_ack') {
+				// The output transitioned to a `finished` state, and we didn't do it
+				throw new Error('Unexpected output state finished');
 			}
+			if (state.state === 'no_more' || state.state === 'no_more_ack') {
+				if (state.state === 'no_more') {
+					output.gotNoMore();
+				}
+				// Unfortunately, if the readable is part of a Duplex like a socket, there
+				// is no safe way to indicate we don't want any more data without potentially
+				// stopping the writable end as well
+				break;
+			}
+			// Wait for abort, or state change in the output pin, or state change in the readable
+			await listener.changed;
 		}
 	}
 	finally {
@@ -159,13 +162,20 @@ export async function processReadable<T>(readable: ReadableLike, output: PipeWri
 	}
 }
 
-// Reads from `input` and writes the read packets to `writable`
-// Handles back-pressure from `writable`, not writing to it nor reading from `input` if the buffer is full
-// Throws if `abort` is aborted or if `writable` emits an error
-// Destroys `writable` in case of an abort
-// Ends `writable` if `input` transitions to `finished`
-// Transitions to `no_more` if `writable` is destroyed without error
-// Returns once `input` is either in `finished` or `no_more` states
+/**
+ * Reads from `input` and writes the read packets to `writable`.
+ * Handles back-pressure from `writable`, not writing to it nor reading from `input` if the buffer is full.
+ * Throws if `abort` is aborted or if `writable` emits an error.
+ * Destroys `writable` in case of an abort.
+ * Ends `writable` if `input` transitions to `finished`.
+ * Transitions to `no_more` if `writable` is destroyed without error.
+ * Returns once `input` is either in `finished` or `no_more` states.
+ *
+ * @param input - Input stream from which data is read.
+ * @param writable - Output stream to which data is written.
+ * @param [options] - Additional options.
+ * @param [options.abort] - If aborted, stops processing and throws.
+ */
 export async function processWritable<T>(input: PipeReadPin<T>, writable: WritableLike, options: {
 	abort?: Abort,
 } = {}): Promise<void> {
@@ -173,6 +183,7 @@ export async function processWritable<T>(input: PipeReadPin<T>, writable: Writab
 		abort,
 	} = options;
 	const writableChangeRoot = new ChangeListener();
+	let writableWaitDrain: boolean = false;
 	let writableHasDrain: boolean = true;
 	let writableHasFinish: boolean = false;
 	let writableHasError: boolean = false;
@@ -202,97 +213,99 @@ export async function processWritable<T>(input: PipeReadPin<T>, writable: Writab
 	writable.on('close', onClose);
 	try {
 		while (true) {
-			const listener = new ChangeListener(input.changeRoot);
-			try {
-				listener.addRoot(writableChangeRoot);
-				if (abort) {
-					listener.addRoot(abort.changeRoot);
-					if (abort.aborted) {
-						throw abort.reason;
-					}
+			using listener = new ChangeListener(input.changeRoot);
+			listener.addRoot(writableChangeRoot);
+			if (abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					throw abort.reason;
 				}
-				const state = input.state;
-				if (writableHasError) {
-					// Forward errors from the writable regardless of the state of the input pin
-					throw writableError;
+			}
+			const state = input.state;
+			if (writableHasError) {
+				// Forward errors from the writable regardless of the state of the input pin
+				throw writableError;
+			}
+			if (state.state === 'idle') {
+				if (writableHasClose) {
+					// Writable destroyed without error
+					input.noMore();
+					return;
 				}
-				if (state.state === 'idle') {
-					if (writableHasClose) {
-						// Writable destroyed without error
-						input.noMore();
-						return;
-					}
-					// Respect back-pressure
-					if (writableHasDrain) {
-						// Request a value to be written to the writable
-						input.wantsValue();
-						continue;
-					}
+				// Respect back-pressure
+				if (writableHasDrain) {
+					// Request a value to be written to the writable
+					input.wantsValue();
+					continue;
 				}
-				if (state.state === 'has_value') {
-					if (writableHasClose) {
-						// Writable destroyed without error
-						// Discard the value, so we can transition to `no_more`
+			}
+			if (state.state === 'has_value') {
+				if (writableHasClose) {
+					// Writable destroyed without error
+					// Discard the value, so we can transition to `no_more`
+					input.gotValue();
+					continue;
+				}
+				// Respect back-pressure
+				if (writableHasDrain) {
+					if (writableWaitDrain) {
+						// Already sent this value, acknowledge it
+						writableWaitDrain = false;
 						input.gotValue();
 						continue;
 					}
-					// Respect back-pressure
+					// Try to write the value to writable
+					const value = state.value;
+					writableHasDrain = writable.write(value);
 					if (writableHasDrain) {
-						// Try to write the value to writable
-						const value = state.value;
+						// If the value has been successfully buffered, consume it
 						input.gotValue();
-						writableHasDrain = writable.write(value);
-						continue;
 					}
-				}
-				if (state.state === 'finished' || state.state === 'finished_ack') {
-					// Respect back-pressure
-					if (writableHasDrain) {
-						if (state.state === 'finished') {
-							input.gotFinish();
-						}
-						// End the writable stream
-						writable.end();
-						break;
+					else {
+						// Otherwise, wait for a drain. This allows reusing the same buffer,
+						// so long as the downstream writable is not keeping a reference to it.
+						writableWaitDrain = true;
 					}
+					continue;
 				}
-				if (state.state === 'no_more' || state.state === 'no_more_ack') {
-					// The input transitioned to a `no_more` state, and we didn't do it
-					throw new Error('Unexpected input state no_more');
+			}
+			if (state.state === 'finished' || state.state === 'finished_ack') {
+				// Respect back-pressure
+				if (writableHasDrain) {
+					if (state.state === 'finished') {
+						input.gotFinish();
+					}
+					// End the writable stream
+					writable.end(null);
+					break;
 				}
-				// Wait for input state change or writable state change
-				await listener.changed;
 			}
-			finally {
-				// Ensure cleanup from all change roots
-				listener.change();
+			if (state.state === 'no_more' || state.state === 'no_more_ack') {
+				// The input transitioned to a `no_more` state, and we didn't do it
+				throw new Error('Unexpected input state no_more');
 			}
+			// Wait for input state change or writable state change
+			await listener.changed;
 		}
 		// Wait for 'end' to be successfully written
 		while (true) {
-			const listener = new ChangeListener(writableChangeRoot);
-			try {
-				if (abort) {
-					listener.addRoot(abort.changeRoot);
-					if (abort.aborted) {
-						throw abort.reason;
-					}
+			using listener = new ChangeListener(writableChangeRoot);
+			if (abort) {
+				listener.addRoot(abort.changeRoot);
+				if (abort.aborted) {
+					throw abort.reason;
 				}
-				if (writableHasError) {
-					// Forward errors from the writable regardless of the state of the input pin
-					throw writableError;
-				}
-				if (writableHasClose || writableHasFinish) {
-					// Writable ended or destroyed without error
-					return;
-				}
-				// Wait for writable state change
-				await listener.changed;
 			}
-			finally {
-				// Ensure cleanup from all change roots
-				listener.change();
+			if (writableHasError) {
+				// Forward errors from the writable regardless of the state of the input pin
+				throw writableError;
 			}
+			if (writableHasClose || writableHasFinish) {
+				// Writable ended or destroyed without error
+				return;
+			}
+			// Wait for writable state change
+			await listener.changed;
 		}
 	}
 	finally {

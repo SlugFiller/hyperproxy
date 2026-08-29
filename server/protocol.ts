@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,26 +15,22 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from './pin-stream/abort.ts';
 import {
+	type PipeReadPin,
+	type PipeWritePin,
 	sendValue,
 } from './pin-stream/pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
-} from './pin-stream/pin-stream.ts';
 import {
+	type PacketProcessResult,
 	decodePacketStream,
 	readPacket,
 	transformPacketStream,
 } from './pin-stream/transform.ts';
-import type {
-	PacketProcessResult,
-} from './pin-stream/transform.ts';
-import type {
-	ActiveProxy,
+import {
+	type ActiveProxy,
 } from './proxy-manager.ts';
 
 export type ServerRequestPacket = {
@@ -243,6 +241,7 @@ export async function sendServerServiceList(input: PipeReadPin<Uint8Array>, outp
 export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?: {
 	abort?: Abort,
 }): Promise<CmdRequestPacket> {
+	const decoder = new TextDecoder('utf-8', { fatal: true });
 	return await readPacket(input, async (buffer): Promise<PacketProcessResult<CmdRequestPacket>> => {
 		if (buffer.length < 1) {
 			// Need more data
@@ -358,7 +357,7 @@ export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?
 					packet: {
 						type: 'add_service',
 						name: buffer.subarray(11, 11 + nameLength),
-						host: Buffer.from(buffer.subarray(11 + nameLength, 11 + nameLength + hostLength)).toString(),
+						host: decoder.decode(buffer.subarray(11 + nameLength, 11 + nameLength + hostLength)),
 						port,
 					},
 					bytesUsed: 11 + nameLength + hostLength,
@@ -468,7 +467,7 @@ export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?
 					complete: true,
 					packet: {
 						type: 'add_server',
-						name: Buffer.from(buffer.subarray(9, 9 + nameLength)).toString(),
+						name: decoder.decode(buffer.subarray(9, 9 + nameLength)),
 						publicKey: buffer.subarray(9 + nameLength, 9 + nameLength + publicKeyLength),
 					},
 					bytesUsed: 9 + nameLength + publicKeyLength,
@@ -496,7 +495,7 @@ export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?
 					complete: true,
 					packet: {
 						type: 'remove_server',
-						name: Buffer.from(buffer.subarray(5, 5 + nameLength)).toString(),
+						name: decoder.decode(buffer.subarray(5, 5 + nameLength)),
 					},
 					bytesUsed: 5 + nameLength,
 				};
@@ -523,7 +522,7 @@ export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?
 					complete: true,
 					packet: {
 						type: 'list',
-						serverName: Buffer.from(buffer.subarray(5, 5 + serverNameLength)).toString(),
+						serverName: decoder.decode(buffer.subarray(5, 5 + serverNameLength)),
 					},
 					bytesUsed: 5 + serverNameLength,
 				};
@@ -552,7 +551,7 @@ export async function receiveCmdRequest(input: PipeReadPin<Uint8Array>, options?
 					complete: true,
 					packet: {
 						type: 'proxy',
-						serverName: Buffer.from(buffer.subarray(11, 11 + serverNameLength)).toString(),
+						serverName: decoder.decode(buffer.subarray(11, 11 + serverNameLength)),
 						serviceName: buffer.subarray(11 + serverNameLength, 11 + serverNameLength + serviceNameLength),
 						port,
 					},
@@ -592,6 +591,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 }): Promise<boolean> {
 	// Encode the message
 	let encoded: Uint8Array;
+	const encoder = new TextEncoder();
 
 	switch (request.type) {
 		case 'show_key': {
@@ -625,7 +625,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'add_service': {
-			const hostBuffer = request.host !== undefined ? Buffer.from(request.host) : null;
+			const hostBuffer = request.host !== undefined ? encoder.encode(request.host) : null;
 			encoded = new Uint8Array(7 + request.name.length + (hostBuffer ? 4 + hostBuffer.length : 0));
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = hostBuffer ? 6 : 5;
@@ -669,7 +669,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'add_server': {
-			const nameBuffer = Buffer.from(request.name);
+			const nameBuffer = encoder.encode(request.name);
 			encoded = new Uint8Array(9 + nameBuffer.length + request.publicKey.length);
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = 10;
@@ -681,7 +681,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'remove_server': {
-			const nameBuffer = Buffer.from(request.name);
+			const nameBuffer = encoder.encode(request.name);
 			encoded = new Uint8Array(5 + nameBuffer.length);
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = 11;
@@ -691,7 +691,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'list': {
-			const serverNameBuffer = Buffer.from(request.serverName);
+			const serverNameBuffer = encoder.encode(request.serverName);
 			encoded = new Uint8Array(5 + serverNameBuffer.length);
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = 12;
@@ -701,7 +701,7 @@ export async function sendCmdRequest(output: PipeWritePin<Uint8Array>, request: 
 		}
 
 		case 'proxy': {
-			const serverNameBuffer = Buffer.from(request.serverName);
+			const serverNameBuffer = encoder.encode(request.serverName);
 			encoded = new Uint8Array(11 + serverNameBuffer.length + request.serviceName.length);
 			const dataview = new DataView(encoded.buffer);
 			encoded[0] = 13;
@@ -816,6 +816,7 @@ export async function receiveCmdServiceList(input: PipeReadPin<Uint8Array>, outp
 }>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const decoder = new TextDecoder('utf-8', { fatal: true });
 	await decodePacketStream(input, output, (buffer): Promise<PacketProcessResult<{
 		name: Uint8Array,
 		host?: string,
@@ -854,7 +855,7 @@ export async function receiveCmdServiceList(input: PipeReadPin<Uint8Array>, outp
 				complete: true,
 				packet: {
 					name: buffer.subarray(11, 11 + nameLength),
-					host: Buffer.from(buffer.subarray(11 + nameLength, 11 + nameLength + hostLength)).toString(),
+					host: decoder.decode(buffer.subarray(11 + nameLength, 11 + nameLength + hostLength)),
 					port,
 				},
 				bytesUsed: 11 + nameLength + hostLength,
@@ -886,12 +887,13 @@ export async function sendCmdServiceList(input: PipeReadPin<{
 }>, output: PipeWritePin<Uint8Array>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const encoder = new TextEncoder();
 	await transformPacketStream(input, output, ({
 		name,
 		host,
 		port,
 	}): Promise<Uint8Array> => {
-		const hostBuffer = host ? Buffer.from(host) : null;
+		const hostBuffer = host ? encoder.encode(host) : null;
 		const encoded: Uint8Array = new Uint8Array(7 + name.length + (hostBuffer ? hostBuffer.length + 4 : 0));
 		const dataview = new DataView(encoded.buffer);
 		dataview.setUint16(0, port, true);
@@ -957,6 +959,7 @@ export async function receiveCmdServerList(input: PipeReadPin<Uint8Array>, outpu
 }>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const decoder = new TextDecoder('utf-8', { fatal: true });
 	await decodePacketStream(input, output, (buffer): Promise<PacketProcessResult<{
 		name: string,
 		publicKey: Uint8Array,
@@ -982,7 +985,7 @@ export async function receiveCmdServerList(input: PipeReadPin<Uint8Array>, outpu
 		return Promise.resolve({
 			complete: true,
 			packet: {
-				name: Buffer.from(buffer.subarray(8, 8 + nameLength)).toString(),
+				name: decoder.decode(buffer.subarray(8, 8 + nameLength)),
 				publicKey: buffer.subarray(8 + nameLength, 8 + nameLength + publicKeyLength),
 			},
 			bytesUsed: 8 + nameLength + publicKeyLength,
@@ -996,11 +999,12 @@ export async function sendCmdServerList(input: PipeReadPin<{
 }>, output: PipeWritePin<Uint8Array>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const encoder = new TextEncoder();
 	await transformPacketStream(input, output, ({
 		name,
 		publicKey,
 	}): Promise<Uint8Array> => {
-		const nameBuffer = Buffer.from(name);
+		const nameBuffer = encoder.encode(name);
 		const encoded: Uint8Array = new Uint8Array(8 + nameBuffer.length + publicKey.length);
 		const dataview = new DataView(encoded.buffer);
 		dataview.setUint32(0, nameBuffer.length, true);
@@ -1014,6 +1018,7 @@ export async function sendCmdServerList(input: PipeReadPin<{
 export async function receiveCmdProxyList(input: PipeReadPin<Uint8Array>, output: PipeWritePin<ActiveProxy>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const decoder = new TextDecoder('utf-8', { fatal: true });
 	await decodePacketStream(input, output, (buffer): Promise<PacketProcessResult<ActiveProxy>> => {
 		if (buffer.length < 10) {
 			// Need more data
@@ -1038,7 +1043,7 @@ export async function receiveCmdProxyList(input: PipeReadPin<Uint8Array>, output
 			complete: true,
 			packet: {
 				port,
-				serverName: Buffer.from(buffer.subarray(10, 10 + serverNameLength)).toString(),
+				serverName: decoder.decode(buffer.subarray(10, 10 + serverNameLength)),
 				serviceName: buffer.subarray(10 + serverNameLength, 10 + serverNameLength + serviceNameLength),
 			},
 			bytesUsed: 10 + serverNameLength + serviceNameLength,
@@ -1049,12 +1054,13 @@ export async function receiveCmdProxyList(input: PipeReadPin<Uint8Array>, output
 export async function sendCmdProxyList(input: PipeReadPin<ActiveProxy>, output: PipeWritePin<Uint8Array>, options?: {
 	abort?: Abort,
 }): Promise<void> {
+	const encoder = new TextEncoder();
 	await transformPacketStream(input, output, ({
 		port,
 		serverName,
 		serviceName,
 	}): Promise<Uint8Array> => {
-		const serverNameBuffer = Buffer.from(serverName);
+		const serverNameBuffer = encoder.encode(serverName);
 		const encoded: Uint8Array = new Uint8Array(10 + serverNameBuffer.length + serviceName.length);
 		const dataview = new DataView(encoded.buffer);
 		dataview.setUint16(0, port, true);

@@ -4,6 +4,6 @@
 		"hyperdht": "latest",
 		"@callstack/licenses": "latest",
 		"@scure/bip39": "latest",
-		"@types/b4a": "latest"
+		"@types/node": "latest"
 	}
 }

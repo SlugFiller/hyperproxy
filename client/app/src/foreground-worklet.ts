@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -41,25 +43,25 @@ export async function runWorklet() {
 	worklet.update = () => {};
 
 	const stream = new Duplex({
-		writev(buffers: Uint8Array[], callback: (err?: Error) => void) {
+		writev(buffers: Uint8Array[], callback: (err: Error | null) => void) {
 			(async () => {
 				const buffer = b4a.concat(buffers);
 				if (buffer.byteLength <= 0) {
-					callback();
+					callback(null);
 					return;
 				}
 				const encoded = b4a.toString(buffer, 'base64');
 				await ForegroundWorklet.writeWorklet(encoded)
-				callback();
+				callback(null);
 			})().catch(callback);
 		},
-		final(callback: (err?: Error) => void) {
+		final(callback: (err: Error | null) => void) {
 			(async () => {
 				await ForegroundWorklet.writeWorklet('')
-				callback();
+				callback(null);
 			})().catch(callback);
 		},
-		read(callback: (err?: Error) => void) {
+		read(callback: (err: Error | null) => void) {
 			(async () => {
 				const buffer = await ForegroundWorklet.readWorklet()
 				if (buffer === '') {
@@ -68,7 +70,7 @@ export async function runWorklet() {
 				else {
 					this.push(b4a.from(buffer, 'base64'));
 				}
-				callback();
+				callback(null);
 			})().catch(callback);
 		},
 	});
@@ -87,25 +89,25 @@ export function useForegroundWorklet() {
 
 	useEffect(() => {
 		const stream = new Duplex({
-			writev(buffers: Uint8Array[], callback: (err?: Error) => void) {
+			writev(buffers: Uint8Array[], callback: (err: Error | null) => void) {
 				(async () => {
 					const buffer = b4a.concat(buffers);
 					if (buffer.byteLength <= 0) {
-						callback();
+						callback(null);
 						return;
 					}
 					const encoded = b4a.toString(buffer, 'base64');
 					await ForegroundWorklet.writeMain(encoded)
-					callback();
+					callback(null);
 				})().catch(callback);
 			},
-			final(callback: (err?: Error) => void) {
+			final(callback: (err: Error | null) => void) {
 				(async () => {
 					await ForegroundWorklet.writeMain('')
-					callback();
+					callback(null);
 				})().catch(callback);
 			},
-			read(callback: (err?: Error) => void) {
+			read(callback: (err: Error | null) => void) {
 				(async () => {
 					const buffer = await ForegroundWorklet.readMain()
 					if (buffer === '') {
@@ -114,7 +116,7 @@ export function useForegroundWorklet() {
 					else {
 						this.push(b4a.from(buffer, 'base64'));
 					}
-					callback();
+					callback(null);
 				})().catch(callback);
 			},
 		});

@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -17,20 +19,19 @@ import type DHT from 'hyperdht';
 import {
 	createServer,
 } from 'bare-tcp';
-import b4a from 'b4a';
 import {
 	sendServerRequest,
 } from './protocol.ts';
 import {
 	Abort,
+	anyAbort,
 } from '../src/pin-stream/abort.ts';
 import {
-	ChangeListener,
-} from '../src/pin-stream/change.ts';
+	Eventual,
+} from '../src/pin-stream/eventual.ts';
 import {
 	createClosedWritePin,
 	createPipe,
-	sendFinish,
 	sendValue,
 } from '../src/pin-stream/pin-stream.ts';
 import {
@@ -38,13 +39,11 @@ import {
 	processWritable,
 } from '../src/pin-stream/pin-stream-compat.ts';
 import {
-	runProcesses,
+	Processes,
 } from '../src/pin-stream/processes.ts';
 import {
+	type StreamSplitterStream,
 	streamSplitter,
-} from '../src/pin-stream/stream-splitter.ts';
-import type {
-	StreamSplitterStream,
 } from '../src/pin-stream/stream-splitter.ts';
 import {
 	waitTimeout,
@@ -53,162 +52,194 @@ import {
 	Unrace,
 } from '../src/pin-stream/unrace.ts';
 
-const activeProxies = new Map<string, Map<string, {
-	port: number,
-	abort: Abort,
-}>>();
+export class ProxyManager {
+	#activeProxies = new Map<string, Map<string, {
+		port: number,
+		abort: Abort,
+	}>>();
+	#processes: Processes;
 
-export async function addOrGetProxy(node: DHT, keyPair: {
-	publicKey: Uint8Array,
-	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	if (!activeProxies.has(server64)) {
-		activeProxies.set(server64, new Map());
+	constructor(options: {
+		abort?: Abort,
+	} = {}) {
+		this.#processes = new Processes({ abort: options.abort });
 	}
-	const services = activeProxies.get(server64)!;
-	const prev = services.get(service64);
-	if (prev) {
-		return prev.port;
-	}
-	try {
-		const created = await createProxy(node, keyPair, serverKey, serviceName, port);
-		services.set(service64, created);
-		return created.port;
-	}
-	finally {
-		if (services.size < 1) {
-			activeProxies.delete(server64)
+
+	async addOrGetProxy(node: DHT, keyPair: {
+		publicKey: Uint8Array,
+		secretKey: Uint8Array,
+	}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
+		const server64 = serverKey.toBase64();
+		const service64 = serviceName.toBase64();
+		if (!this.#activeProxies.has(server64)) {
+			this.#activeProxies.set(server64, new Map());
 		}
-	}
-}
-
-export function getProxy(serverKey: Uint8Array, serviceName: Uint8Array): number {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
-		return 0;
-	}
-	const proxy = services.get(service64);
-	if (!proxy) {
-		return 0;
-	}
-	return proxy.port;
-}
-
-export function removeProxy(serverKey: Uint8Array, serviceName: Uint8Array): void {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const service64 = b4a.toString(serviceName, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
-		return;
-	}
-	const proxy = services.get(service64);
-	if (!proxy) {
-		return;
-	}
-	services.delete(service64);
-	if (services.size < 1) {
-		activeProxies.delete(server64)
-	}
-	proxy.abort.abort();
-}
-
-export function removeAllProxies(serverKey: Uint8Array): void {
-	const server64 = b4a.toString(serverKey, 'base64');
-	const services = activeProxies.get(server64)
-	if (!services) {
-		return;
-	}
-	for (const { abort } of services.values()) {
-		abort.abort();
-	}
-	activeProxies.delete(server64)
-}
-
-async function createProxy(node: DHT, keyPair: {
-	publicKey: Uint8Array,
-	secretKey: Uint8Array,
-}, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<{
-	port: number,
-	abort: Abort,
-}> {
-	const { readPin: localStreamsReadPin, writePin: localStreamsWritePin } = createPipe<StreamSplitterStream>();
-	const localStreamsUnrace = new Unrace();
-	const abort = new Abort();
-
-	(async function retry() {
-		const remote = node.connect(serverKey, { keyPair });
-		remote.on('error', (error: unknown) => {
-			// The default behavior for `EventEmitter` is to crash the VM if an error
-			// is emitted without a handler. This handler pre-emptively prevents this
-			console.log('Proxy socket error', error);
-		});
-		// Manage connection to server
-		try {
-			await runProcesses(async (processes, optionsProc) => {
-				const { readPin, writePin: joinedOutput } = createPipe<Uint8Array>();
-				const { readPin: joinedInput, writePin } = createPipe<Uint8Array>();
-
-				await sendValue(processes, async (options) => {
-					await processReadable(remote, writePin, options);
-				}, optionsProc);
-
-				await sendValue(processes, async (options) => {
-					await processWritable(readPin, remote, options);
-				}, optionsProc);
-
-				await sendValue(processes, async (options) => {
-					// First send request
-					await sendServerRequest(joinedOutput, {
-						type: 'proxy',
-						serviceName,
-					}, options);
-
-					// Then treat the rest of the stream as part of the stream splitter
-					await streamSplitter(joinedInput, joinedOutput, localStreamsReadPin, createClosedWritePin<StreamSplitterStream>(), options);
-				}, optionsProc);
-
-				await sendFinish(processes, optionsProc);
-			}, {
-				abort,
-			});
+		const services = this.#activeProxies.get(server64)!;
+		const prev = services.get(service64);
+		if (prev) {
+			return prev.port;
 		}
-		finally {
-			if (!abort.aborted) {
-				// Connection failed or unexpectedly disconnected
-				(async () => {
-					// Wait 5 seconds
-					await waitTimeout(5000, {
-						abort,
-					});
-					// Spawn another connection
-					retry().catch((error: unknown) => {
-						if (!abort.aborted) {
-							// Unexpected disconnection is logged here
-							console.log(error);
-						}
-					});
-				})().catch((error: unknown) => {
-					if (!abort.aborted) {
-						// Should not arrive here, since there's nothing else that could throw
-						// Log an error anyway
-						console.log(error);
-					}
+		const proxy = {
+			port: 0,
+			abort: new Abort(),
+		};
+		// Pre-emptively add proxy to active list to prevent `services` from being removed
+		services.set(service64, proxy);
+		const errorAbort = new Abort();
+		const result = new Eventual<number>();
+		this.#processes.run(async () => {
+			try {
+				await using processesProxy = new Processes({ abort: this.#processes.abort })
+
+				// Run proxy
+				const finalPort = new Eventual<number>();
+				processesProxy.run(async () => {
+					await runProxy(finalPort, node, keyPair, serverKey, serviceName, port, processesProxy.abort);
 				});
+				proxy.port = await finalPort.getValue({ abort: processesProxy.abort });
+
+				result.setValue(proxy.port);
+
+				await anyAbort(proxy.abort, processesProxy.abort);
+			}
+			catch (error) {
+				errorAbort.abort(error);
+			}
+			finally {
+				if (services.get(service64) === proxy) {
+					services.delete(server64)
+				}
+				if (services.size < 1 && this.#activeProxies.get(server64) === services) {
+					this.#activeProxies.delete(server64)
+				}
+			}
+		});
+		return await result.getValue({ abort: errorAbort });
+	}
+
+	getProxy(serverKey: Uint8Array, serviceName: Uint8Array): number {
+		const server64 = serverKey.toBase64();
+		const service64 = serviceName.toBase64();
+		const services = this.#activeProxies.get(server64)
+		if (!services) {
+			return 0;
+		}
+		const proxy = services.get(service64);
+		if (!proxy) {
+			return 0;
+		}
+		return proxy.port;
+	}
+
+	removeProxy(serverKey: Uint8Array, serviceName: Uint8Array): void {
+		const server64 = serverKey.toBase64();
+		const service64 = serviceName.toBase64();
+		const services = this.#activeProxies.get(server64)
+		if (!services) {
+			return;
+		}
+		const proxy = services.get(service64);
+		if (!proxy) {
+			return;
+		}
+		services.delete(service64);
+		if (services.size < 1) {
+			this.#activeProxies.delete(server64)
+		}
+		proxy.abort.abort();
+	}
+
+	removeAllProxies(serverKey: Uint8Array): void {
+		const server64 = serverKey.toBase64();
+		const services = this.#activeProxies.get(server64)
+		if (!services) {
+			return;
+		}
+		for (const { abort } of services.values()) {
+			abort.abort();
+		}
+		this.#activeProxies.delete(server64)
+	}
+
+	async [Symbol.asyncDispose](): Promise<void> {
+		await using _ = this.#processes;
+	}
+}
+
+async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
+	publicKey: Uint8Array,
+	secretKey: Uint8Array,
+}, serverKey: Uint8Array, serviceName: Uint8Array, port: number, abort: Abort): Promise<void> {
+	const localStreams = createPipe<StreamSplitterStream>();
+	const localStreamsUnrace = new Unrace();
+	await using processesProxy = new Processes({ abort });
+
+	async function retry() {
+		try {
+			using remoteStack = new DisposableStack();
+			const remote = remoteStack.adopt(node.connect(serverKey, { keyPair }), (r) => {
+				r.destroy();
+			});
+			remote.on('error', (error: unknown) => {
+				// The default behavior for `EventEmitter` is to crash the VM if an error
+				// is emitted without a handler. This handler pre-emptively prevents this
+				console.log('Proxy socket error', error);
+			});
+			// Manage connection to server
+			await using processes = new Processes({ abort: processesProxy.abort });
+
+			const { writePin: joinedOutput, readPin: socketInput } = createPipe<Uint8Array>();
+			const { writePin: socketOutput, readPin: joinedInput } = createPipe<Uint8Array>();
+
+			processes.run(async () => {
+				await processReadable(remote, socketOutput, { abort: processes.abort });
+			});
+
+			processes.run(async () => {
+				await processWritable(socketInput, remote, { abort: processes.abort });
+			});
+
+			processes.run(async () => {
+				// First send request
+				await sendServerRequest(joinedOutput, {
+					type: 'proxy',
+					serviceName,
+				}, { abort: processes.abort });
+
+				// Then treat the rest of the stream as part of the stream splitter
+				await streamSplitter(joinedInput, joinedOutput, localStreams.readPin, createClosedWritePin<StreamSplitterStream>(), { abort: processes.abort });
+			});
+
+			await processes.finish();
+		}
+		catch (error) {
+			if (!processesProxy.abort.aborted) {
+				// Unexpected disconnection is logged here
+				console.log(error);
 			}
 		}
-	})().catch((error: unknown) => {
-		if (!abort.aborted) {
-			// Unexpected disconnection is logged here
-			console.log(error);
+		finally {
+			if (processesProxy.abort.aborted) {
+				return;
+			}
+
+			// Connection failed or unexpectedly disconnected
+			// Wait 5 seconds
+			await waitTimeout(5000, {
+				abort,
+			});
+			// Spawn another connection
+			processesProxy.run(retry);
 		}
-	});
+	}
+	// Spawn connection
+	processesProxy.run(retry);
 
 	// Listen for incoming connections
-	const server = createServer();
+	using serverStack = new DisposableStack();
+	const server = serverStack.adopt(createServer(), (r) => {
+		r.close();
+	});
 	server.on('error', (error: unknown) => {
 		// The default behavior for `EventEmitter` is to crash the VM if an error
 		// is emitted without a handler. This handler pre-emptively prevents this
@@ -221,104 +252,72 @@ async function createProxy(node: DHT, keyPair: {
 			console.log('Incoming socket error', error);
 		});
 		// Incoming connection to local socket
-		(async () => {
+		processesProxy.run(async () => {
 			const localAbort = new Abort();
 			try {
-				await runProcesses(async (processes, optionsProc = {}) => {
-					const {
-						abort: remoteAbort,
-					} = optionsProc;
-
-					const { readPin, writePin: socketWritePin } = createPipe<Uint8Array>();
-					const { readPin: socketReadPin, writePin } = createPipe<Uint8Array>();
-
-					await sendValue(processes, async (options) => {
-						await processReadable(socket, socketWritePin, options);
-					}, optionsProc);
-
-					await sendValue(processes, async (options) => {
-						await processWritable(socketReadPin, socket, options);
-					}, optionsProc);
-
-					// Send this socket as a new local connection to the stream splitter
-					await localStreamsUnrace.run(async () => {
-						await sendValue(localStreamsWritePin, {
-							readPin,
-							writePin,
-							localAbort,
-							remoteAbort,
-						}, optionsProc);
-					}, optionsProc);
-				}, {
-					abort,
+				using socketStack = new DisposableStack();
+				socketStack.adopt(socket, (r) => {
+					r.destroy();
 				});
+				await using processes = new Processes({ abort });
+				const {
+					abort: remoteAbort,
+				} = processes;
+
+				const { writePin: socketOutput, readPin } = createPipe<Uint8Array>();
+				const { writePin, readPin: socketInput } = createPipe<Uint8Array>();
+
+				processes.run(async () => {
+					await processReadable(socket, socketOutput, { abort: remoteAbort });
+				});
+
+				processes.run(async () => {
+					await processWritable(socketInput, socket, { abort: remoteAbort });
+				});
+
+				{
+					// Send this socket as a new local connection to the stream splitter
+					using _ = await localStreamsUnrace.run(undefined, { abort: remoteAbort });
+					await sendValue(localStreams.writePin, {
+						readPin,
+						writePin,
+						localAbort,
+						remoteAbort,
+					}, { abort: remoteAbort });
+				}
+
+				await processes.finish();
 			}
 			catch (error) {
 				localAbort.abort(error);
-				throw error;
+				console.log(error);
 			}
 			finally {
 				localAbort.abort();
-				socket.destroy();
 			}
-		})().catch((error: unknown) => {
-			console.log(error);
 		});
-	});
-
-	(async () => {
-		// Close the listener on abort
-		try {
-			while (true) {
-				const listener = new ChangeListener(abort.changeRoot);
-
-				try {
-					if (abort.aborted) {
-						break;
-					}
-
-					// Wait for the abort state to change
-					await listener.changed;
-				}
-				finally {
-					// Ensure cleanup from all change roots
-					listener.change();
-				}
-			}
-		}
-		finally {
-			server.close();
-		}
-	})().catch((error: unknown) => {
-		// There's nothing in that function that can actually throw, but just for completeness's sake
-		console.log(error);
 	});
 
 	// Listen only on localhost, on the specified port, or on a random port if the port is 0
-	try {
-		await new Promise<void>((resolve, reject) => {
-			function onListening() {
-				server.off('listening', onListening);
-				server.off('error', onError);
-				resolve();
-			}
-			function onError(error: unknown) {
-				server.off('listening', onListening);
-				server.off('error', onError);
-				reject(error);
-			}
-			server.on('listening', onListening);
-			server.on('error', onError);
-			server.listen(port, '127.0.0.1');
-		});
-		return {
-			port: server.address().port,
-			abort,
-		};
+	await new Promise<void>((resolve, reject) => {
+		function onListening() {
+			server.off('listening', onListening);
+			server.off('error', onError);
+			resolve();
+		}
+		function onError(error: Error) {
+			server.off('listening', onListening);
+			server.off('error', onError);
+			reject(error);
+		}
+		server.on('listening', onListening);
+		server.on('error', onError);
+		server.listen(port, '127.0.0.1');
+	});
+	const address = server.address();
+	if (address === null || typeof address !== 'object') {
+		throw new Error('Failed to retrieve bound address for listener');
 	}
-	catch (error) {
-		// If listener failed to start, ensure the connection to the server is closed as well
-		abort.abort(error);
-		throw error;
-	}
+	finalPort.setValue(address.port);
+	await anyAbort(processesProxy.abort);
 }

@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -15,11 +17,11 @@
 
 import DHT from 'hyperdht';
 import {
+	type Types,
+} from '@callstack/licenses';
+import {
 	scanDependencies,
 } from '@callstack/licenses/node';
-import type {
-	Types,
-} from '@callstack/licenses';
 import {
 	entropyToMnemonic,
 	mnemonicToEntropy,
@@ -38,9 +40,6 @@ import {
 import {
 	DatabaseSync,
 } from 'node:sqlite';
-import type {
-	Duplex,
-} from 'node:stream';
 import {
 	fileURLToPath,
 } from 'node:url';
@@ -49,32 +48,34 @@ import {
 } from './drain-readable.ts';
 import {
 	Abort,
+	anyAbort,
 } from './pin-stream/abort.ts';
 import {
+	toAsyncIterable,
+} from './pin-stream/iterable.ts';
+import {
+	type PipeReadPin,
+	type PipeWritePin,
 	createClosedReadPin,
 	createPipe,
 	receiveStop,
-	receiveValue,
 	sendFinish,
 	sendValue,
-} from './pin-stream/pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
 } from './pin-stream/pin-stream.ts';
 import {
 	processReadable,
 	processWritable,
 } from './pin-stream/pin-stream-compat.ts';
 import {
-	runProcesses,
+	Processes,
 } from './pin-stream/processes.ts';
 import {
 	streamSplitter,
+	type StreamSplitterStream,
 } from './pin-stream/stream-splitter.ts';
-import type {
-	StreamSplitterStream,
-} from './pin-stream/stream-splitter.ts';
+import {
+	waitTimeout,
+} from './pin-stream/timeout.ts';
 import {
 	receiveCmdProxyList,
 	receiveCmdRemoteList,
@@ -94,19 +95,14 @@ import {
 	sendServerServiceList,
 } from './protocol.ts';
 import {
-	addProxy,
-	getActiveProxies,
-	removeProxiesByServer,
-	removeProxyByPort,
-} from './proxy-manager.ts';
-import type {
-	ActiveProxy,
+	type ActiveProxy,
+	ProxyManager,
 } from './proxy-manager.ts';
 
 const CMD_PATH = platform === 'win32' ? '\\\\.\\pipe\\hyperproxy-daemon' : '/tmp/hyperproxy-daemon.sock';
 
-async function daemon(noServe: boolean): Promise<void> {
-	const db = new DatabaseSync(fileURLToPath(new URL('config.sqlite', import.meta.url)));
+async function daemon(noServe: boolean, abort: Abort): Promise<void> {
+	using db = new DatabaseSync(fileURLToPath(new URL('config.sqlite', import.meta.url)));
 
 	db.exec(`CREATE TABLE IF NOT EXISTS keypair(
 		publicKey BLOB NOT NULL,
@@ -148,7 +144,10 @@ async function daemon(noServe: boolean): Promise<void> {
 	const queryAddServer = db.prepare(`REPLACE INTO servers(name, publicKey) VALUES ($name, $publicKey)`);
 	const queryRemoveServer = db.prepare(`DELETE FROM servers WHERE name = $name`);
 
-	const node = new DHT();
+	await using nodeStack = new AsyncDisposableStack();
+	const node = nodeStack.adopt(new DHT(), async (r) => {
+		await r.destroy();
+	});
 
 	let keyPair: {
 		publicKey: Uint8Array,
@@ -167,478 +166,499 @@ async function daemon(noServe: boolean): Promise<void> {
 	}
 	else {
 		keyPair = {
-			publicKey: Buffer.from(dbKey.publicKey),
-			secretKey: Buffer.from(dbKey.secretKey),
+			publicKey: new Uint8Array(dbKey.publicKey),
+			secretKey: new Uint8Array(dbKey.secretKey),
 		};
 	}
 
-	const server = node.createServer({
-		firewall: (remotePublicKey: Uint8Array): boolean => {
-			const row = queryCheckRemote.get({
-				$publicKey: remotePublicKey,
-			});
-			return !row;
-		}
-	});
-	server.on('error', (error: unknown) => {
-		// The default behavior for `EventEmitter` is to crash the VM if an error
-		// is emitted without a handler. This handler pre-emptively prevents this
-		console.log('DHT server error', error);
-	});
+	await using processesConnections = new Processes();
+	{
+		await using proxyManager = new ProxyManager({ abort: processesConnections.abort });
 
-	server.on('connection', (socket: Duplex) => {
-		socket.on('error', (error: unknown) => {
+		await using serverStack = new AsyncDisposableStack();
+		const server = serverStack.adopt(node.createServer({
+			firewall: (remotePublicKey: Uint8Array): boolean => {
+				const row = queryCheckRemote.get({
+					$publicKey: remotePublicKey,
+				});
+				return !row;
+			}
+		}), async (r) => {
+			await r.close();
+		});
+
+		server.on('error', (error: unknown) => {
 			// The default behavior for `EventEmitter` is to crash the VM if an error
 			// is emitted without a handler. This handler pre-emptively prevents this
-			console.log('DHT socket error', error);
+			console.log('DHT server error', error);
 		});
-		runProcesses(async (processes, optionsProc = {}) => {
-			const {
-				abort,
-			} = optionsProc;
 
-			const { readPin, writePin: socketWritePin } = createPipe<Uint8Array>();
-			const { readPin: socketReadPin, writePin } = createPipe<Uint8Array>();
-
-			await sendValue(processes, async (options) => {
-				await processReadable(socket, socketWritePin, options);
-			}, optionsProc);
-
-			await sendValue(processes, async (options) => {
-				await processWritable(socketReadPin, socket, options);
-			}, optionsProc);
-
-			const request = await receiveServerRequest(readPin, {
-				abort,
-				serviceLengthChecker(length: number): Promise<void> {
-					if (!queryCheckServiceLength.get({
-						$length: length,
-					})) {
-						return Promise.reject(new Error('Service does not exist'));
-					}
-					return Promise.resolve();
-				},
-				servicePrefixChecker(length: number, prefix: Uint8Array): Promise<void> {
-					const prefixPlus = Buffer.from(prefix);
-					prefixPlus[prefixPlus.byteLength - 1]++;
-					if (!queryCheckServicePrefix.get({
-						$length: length,
-						$prefix: prefix,
-						$prefixPlus: prefixPlus,
-					})) {
-						return Promise.reject(new Error('Service does not exist'));
-					}
-					return Promise.resolve();
-				},
+		server.on('connection', (socket) => {
+			socket.on('error', (error: unknown) => {
+				// The default behavior for `EventEmitter` is to crash the VM if an error
+				// is emitted without a handler. This handler pre-emptively prevents this
+				console.log('DHT socket error', error);
 			});
-
-			switch (request.type) {
-				case 'list': {
-					await receiveStop(readPin, optionsProc);
-
-					const { readPin: listReadPin, writePin: listWritePin } = createPipe<Uint8Array>();
-
-					await sendValue(processes, async (options) => {
-						await sendServerServiceList(listReadPin, writePin, options);
-					}, optionsProc);
-
-					for (const row of queryListServices.iterate()) {
-						await sendValue(listWritePin, (row as {
-							name: Uint8Array,
-						}).name, optionsProc);
-					}
-
-					await sendFinish(listWritePin, optionsProc);
-
-					// Due to a bug in hyperdht, this is the only way to ensure all sent
-					// messages were received before destroying the socket
-					await drainReadable(socket, {
+			processesConnections.run(async () => {
+				try {
+					using socketStack = new DisposableStack();
+					socketStack.adopt(socket, (r) => {
+						r.destroy();
+					});
+					await using processes = new Processes({ abort: processesConnections.abort });
+					const {
 						abort,
-						timeout: 10000,
+					} = processes;
+
+					const { writePin: socketOutput, readPin } = createPipe<Uint8Array>();
+					const { writePin, readPin: socketInput } = createPipe<Uint8Array>();
+
+					processes.run(async () => {
+						await processReadable(socket, socketOutput, { abort });
 					});
-					break;
-				}
 
-				case 'proxy': {
-					const row = queryGetServiceByName.get({
-						$length: request.serviceName.length,
-						$match: request.serviceName,
-					}) as (undefined | {
-						host: Uint8Array | null,
-						port: number,
+					processes.run(async () => {
+						await processWritable(socketInput, socket, { abort });
 					});
-					if (!row) {
-						throw new Error('Service does not exist');
-					}
-					const port = row.port;
-					const host = row.host ? Buffer.from(row.host).toString() : 'localhost';
 
-					const { readPin: remoteStreamsReadPin, writePin: remoteStreamsWritePin } = createPipe<StreamSplitterStream>();
+					const request = await receiveServerRequest(readPin, {
+						abort,
+						serviceLengthChecker(length: number): Promise<void> {
+							if (!queryCheckServiceLength.get({
+								$length: length,
+							})) {
+								return Promise.reject(new Error('Service does not exist'));
+							}
+							return Promise.resolve();
+						},
+						servicePrefixChecker(length: number, prefix: Uint8Array): Promise<void> {
+							const prefixPlus = new Uint8Array(prefix);
+							prefixPlus[prefixPlus.byteLength - 1]++;
+							if (!queryCheckServicePrefix.get({
+								$length: length,
+								$prefix: prefix,
+								$prefixPlus: prefixPlus,
+							})) {
+								return Promise.reject(new Error('Service does not exist'));
+							}
+							return Promise.resolve();
+						},
+					});
 
-					await sendValue(processes, async (options) => {
-						await streamSplitter(readPin, writePin, createClosedReadPin<StreamSplitterStream>(), remoteStreamsWritePin, options);
-					}, optionsProc);
+					switch (request.type) {
+						case 'list': {
+							await receiveStop(readPin, { abort });
 
-					while (true) {
-						const result = await receiveValue(remoteStreamsReadPin, optionsProc);
-						if (result.done) {
+							const { writePin: listOutput, readPin: listEncodeInput } = createPipe<Uint8Array>();
+							const listEncodeOutput = writePin;
+
+							processes.run(async () => {
+								await sendServerServiceList(listEncodeInput, listEncodeOutput, { abort });
+							});
+
+							for (const row of queryListServices.iterate()) {
+								await sendValue(listOutput, (row as {
+									name: Uint8Array,
+								}).name, { abort });
+							}
+
+							await sendFinish(listOutput, { abort });
+
+							// Due to a bug in hyperdht, this is the only way to ensure all sent
+							// messages were received before destroying the socket
+							await drainReadable(socket, {
+								abort,
+								timeout: 10000,
+							});
 							break;
 						}
 
-						const {
-							readPin: connectionReadPin,
-							writePin: connectionWritePin,
-							localAbort,
-							remoteAbort,
-						} = result.value;
+						case 'proxy': {
+							const row = queryGetServiceByName.get({
+								$length: request.serviceName.length,
+								$match: request.serviceName,
+							}) as (undefined | {
+								host: Uint8Array | null,
+								port: number,
+							});
+							if (!row) {
+								throw new Error('Service does not exist');
+							}
+							const port = row.port;
+							const host = row.host ? Buffer.from(row.host).toString() : 'localhost';
 
-						await sendValue(processes, async () => {
-							try {
-								const proxied = createConnection(port, host);
-								proxied.on('error', (error: unknown) => {
-									// The default behavior for `EventEmitter` is to crash the VM if an error
-									// is emitted without a handler. This handler pre-emptively prevents this
-									console.log('Proxied socket error', error);
-								});
+							const remoteStreams = createPipe<StreamSplitterStream>();
 
-								try {
-									await runProcesses(async (processesConn, optionsConn) => {
+							processes.run(async () => {
+								await streamSplitter(readPin, writePin, createClosedReadPin<StreamSplitterStream>(), remoteStreams.writePin, { abort });
+							});
+
+							for await (const {
+								readPin: connectionReadPin,
+								writePin: connectionWritePin,
+								localAbort,
+								remoteAbort,
+							} of toAsyncIterable(remoteStreams.readPin, { abort })) {
+								processes.run(async () => {
+									try {
+										await using proxied = createConnection(port, host);
+										proxied.on('error', (error: unknown) => {
+											// The default behavior for `EventEmitter` is to crash the VM if an error
+											// is emitted without a handler. This handler pre-emptively prevents this
+											console.log('Proxied socket error', error);
+										});
+
+										await using processesConn = new Processes({
+											abort,
+											aborts: [
+												// Also abort on remote abort
+												remoteAbort,
+											],
+										});
+
 										// Bridge connection
-										await sendValue(processesConn, async (optionsWrite) => {
-											await processReadable(proxied, connectionWritePin, optionsWrite);
-										}, optionsConn);
+										processesConn.run(async () => {
+											await processReadable(proxied, connectionWritePin, { abort: processesConn.abort });
+										});
 
-										await sendFinish(processesConn, optionsConn)
+										await processWritable(connectionReadPin, proxied, { abort: processesConn.abort });
 
-										await processWritable(connectionReadPin, proxied, optionsConn);
-									}, {
-										abort: optionsProc?.abort,
-										aborts: [
-											// Also abort on remote abort
-											remoteAbort,
-										],
-									});
-								}
-								finally {
-									proxied?.destroy();
-								}
+										await processesConn.finish();
+									}
+									catch (error) {
+										console.log(error);
+										localAbort?.abort(error);
+									}
+									finally {
+										localAbort?.abort();
+									}
+								});
 							}
-							catch (error) {
-								console.log(error);
-								localAbort?.abort(error);
-							}
-							finally {
-								localAbort?.abort();
-							}
-						}, optionsProc);
+
+							break;
+						}
 					}
 
-					break;
+
+					await processes.finish();
 				}
-			}
-
-			await sendFinish(processes, optionsProc);
-		}).catch((error: unknown) => {
-			console.log(error);
-		}).then(() => {
-			socket.destroy();
-		}).catch((error: unknown) => {
-			console.log(error);
+				catch (error) {
+					console.log(error);
+				}
+			});
 		});
-	});
 
-	if (!noServe) {
-		await server.listen(keyPair);
-	}
+		if (!noServe) {
+			await server.listen(keyPair);
+		}
 
-	const cmd = createServer();
-	cmd.on('error', (error: unknown) => {
-		// The default behavior for `EventEmitter` is to crash the VM if an error
-		// is emitted without a handler. This handler pre-emptively prevents this
-		console.log('Command server error', error);
-	});
-
-	cmd.on('connection', (socket) => {
-		socket.on('error', (error: unknown) => {
+		await using cmd = createServer();
+		cmd.on('error', (error: unknown) => {
 			// The default behavior for `EventEmitter` is to crash the VM if an error
 			// is emitted without a handler. This handler pre-emptively prevents this
-			console.log('Command socket error', error);
+			console.log('Command server error', error);
 		});
-		runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: socketWritePin } = createPipe<Uint8Array>();
-			const { readPin: socketReadPin, writePin } = createPipe<Uint8Array>();
 
-			await sendValue(processes, async (options) => {
-				await processReadable(socket, socketWritePin, options);
-			}, optionsProc);
+		cmd.on('connection', (socket) => {
+			socket.on('error', (error: unknown) => {
+				// The default behavior for `EventEmitter` is to crash the VM if an error
+				// is emitted without a handler. This handler pre-emptively prevents this
+				console.log('Command socket error', error);
+			});
+			processesConnections.run(async () => {
+				try {
+					await using _ = socket;
+					await using processes = new Processes({ abort: processesConnections.abort });
 
-			await sendValue(processes, async (options) => {
-				await processWritable(socketReadPin, socket, options);
-			}, optionsProc);
+					const { writePin: socketOutput, readPin } = createPipe<Uint8Array>();
+					const { writePin, readPin: socketInput } = createPipe<Uint8Array>();
 
-			const request = await receiveCmdRequest(readPin, optionsProc);
-
-			await receiveStop(readPin, optionsProc);
-
-			switch (request.type) {
-				case 'show_key': {
-					await sendCmdResponse(writePin, {
-						type: 'show_key',
-						publicKey: keyPair.publicKey,
-					}, optionsProc);
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'show_services': {
-					const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
-						host?: string,
-						port: number,
-						name: Uint8Array,
-					}>();
-
-					await sendValue(processes, async (options) => {
-						await sendCmdServiceList(listReadPin, writePin, options);
-					}, optionsProc);
-
-					for (const row of queryGetServices.iterate()) {
-						const service = row as {
-							name: Uint8Array,
-							host: string | null,
-							port: number,
-						};
-						await sendValue(listWritePin, service.host === null ? {
-							name: service.name,
-							port: service.port,
-						} : {
-							name: service.name,
-							host: service.host,
-							port: service.port,
-						}, optionsProc);
-					}
-
-					await sendFinish(listWritePin, optionsProc);
-					break;
-				}
-
-				case 'show_remotes': {
-					const { readPin: listReadPin, writePin: listWritePin } = createPipe<Uint8Array>();
-
-					await sendValue(processes, async (options) => {
-						await sendCmdRemoteList(listReadPin, writePin, options);
-					}, optionsProc);
-
-					for (const row of queryGetRemotes.iterate()) {
-						await sendValue(listWritePin, (row as {
-							publicKey: Uint8Array,
-						}).publicKey, optionsProc);
-					}
-
-					await sendFinish(listWritePin, optionsProc);
-					break;
-				}
-
-				case 'show_servers': {
-					const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
-						name: string,
-						publicKey: Uint8Array,
-					}>();
-
-					await sendValue(processes, async (options) => {
-						await sendCmdServerList(listReadPin, writePin, options);
-					}, optionsProc);
-
-					for (const row of queryGetServers.iterate()) {
-						await sendValue(listWritePin, row as {
-							name: string,
-							publicKey: Uint8Array,
-						}, optionsProc);
-					}
-
-					await sendFinish(listWritePin, optionsProc);
-					break;
-				}
-
-				case 'show_proxies': {
-					const { readPin: listReadPin, writePin: listWritePin } = createPipe<ActiveProxy>();
-
-					await sendValue(processes, async (options) => {
-						await sendCmdProxyList(listReadPin, writePin, options);
-					}, optionsProc);
-
-					for (const proxy of getActiveProxies()) {
-						await sendValue(listWritePin, proxy, optionsProc);
-					}
-
-					await sendFinish(listWritePin, optionsProc);
-					break;
-				}
-
-				case 'add_service': {
-					queryAddService.run({
-						$host: request.host ?? null,
-						$port: request.port,
-						$name: request.name,
-					});
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'remove_service': {
-					queryRemoveService.run({
-						$name: request.name,
-					});
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'add_remote': {
-					queryAddRemote.run({
-						$publicKey: request.publicKey,
-					});
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'remove_remote': {
-					queryRemoveRemote.run({
-						$publicKey: request.publicKey,
-					});
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'add_server': {
-					queryAddServer.run({
-						$name: request.name,
-						$publicKey: request.publicKey,
-					});
-					// In case a previous server with a different name was overwritten
-					removeProxiesByServer(request.name);
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'remove_server': {
-					queryRemoveServer.run({
-						$name: request.name,
-					});
-					removeProxiesByServer(request.name);
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-
-				case 'list': {
-					const row = queryGetServerByName.get({
-						$name: request.serverName,
-					}) as (undefined | {
-						publicKey: Uint8Array,
-					});
-					if (!row) {
-						throw new Error('Server does not exist');
-					}
-
-					const { readPin: commandReadPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-
-					// Connect to server
-					const socketConn = node.connect(row.publicKey, {
-						keyPair,
-					});
-					socketConn.on('error', (error: unknown) => {
-						// The default behavior for `EventEmitter` is to crash the VM if an error
-						// is emitted without a handler. This handler pre-emptively prevents this
-						console.log('Request socket error', error);
+					processes.run(async () => {
+						await processReadable(socket, socketOutput, { abort: processes.abort });
 					});
 
-					try {
-						await runProcesses(async (processes, optionsConn) => {
-							await sendValue(processes, async (optionsSub) => {
-								// Stream the result directly to the write pin
-								await processReadable(socketConn, writePin, optionsSub);
-							}, optionsConn);
+					processes.run(async () => {
+						await processWritable(socketInput, socket, { abort: processes.abort });
+					});
 
-							await sendValue(processes, async (optionsSub) => {
-								await processWritable(commandReadPin, socketConn, optionsSub);
-							}, optionsConn);
+					const request = await receiveCmdRequest(readPin, { abort: processes.abort });
 
-							await sendFinish(processes, optionsConn);
+					await receiveStop(readPin, { abort: processes.abort });
+
+					switch (request.type) {
+						case 'show_key': {
+							await sendCmdResponse(writePin, {
+								type: 'show_key',
+								publicKey: keyPair.publicKey,
+							}, { abort: processes.abort });
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'show_services': {
+							const { writePin: listOutput, readPin: listEncodeInput } = createPipe<{
+								host?: string,
+								port: number,
+								name: Uint8Array,
+							}>();
+							const listEncodeOutput = writePin;
+
+							processes.run(async () => {
+								await sendCmdServiceList(listEncodeInput, listEncodeOutput, { abort: processes.abort });
+							});
+
+							for (const row of queryGetServices.iterate()) {
+								const service = row as {
+									name: Uint8Array,
+									host: string | null,
+									port: number,
+								};
+								await sendValue(listOutput, service.host === null ? {
+									name: service.name,
+									port: service.port,
+								} : {
+									name: service.name,
+									host: service.host,
+									port: service.port,
+								}, { abort: processes.abort });
+							}
+
+							await sendFinish(listOutput, { abort: processes.abort });
+							break;
+						}
+
+						case 'show_remotes': {
+							const { writePin: listOutput, readPin: listEncodeInput } = createPipe<Uint8Array>();
+							const listEncodeOutput = writePin;
+
+							processes.run(async () => {
+								await sendCmdRemoteList(listEncodeInput, listEncodeOutput, { abort: processes.abort });
+							});
+
+							for (const row of queryGetRemotes.iterate()) {
+								await sendValue(listOutput, (row as {
+									publicKey: Uint8Array,
+								}).publicKey, { abort: processes.abort });
+							}
+
+							await sendFinish(listOutput, { abort: processes.abort });
+							break;
+						}
+
+						case 'show_servers': {
+							const { writePin: listOutput, readPin: listEncodeInput } = createPipe<{
+								name: string,
+								publicKey: Uint8Array,
+							}>();
+							const listEncodeOutput = writePin;
+
+							processes.run(async () => {
+								await sendCmdServerList(listEncodeInput, listEncodeOutput, { abort: processes.abort });
+							});
+
+							for (const row of queryGetServers.iterate()) {
+								await sendValue(listOutput, row as {
+									name: string,
+									publicKey: Uint8Array,
+								}, { abort: processes.abort });
+							}
+
+							await sendFinish(listOutput, { abort: processes.abort });
+							break;
+						}
+
+						case 'show_proxies': {
+							const { writePin: listOutput, readPin: listEncodeInput } = createPipe<ActiveProxy>();
+							const listEncodeOutput = writePin;
+
+							processes.run(async () => {
+								await sendCmdProxyList(listEncodeInput, listEncodeOutput, { abort: processes.abort });
+							});
+
+							for (const proxy of proxyManager.getActiveProxies()) {
+								await sendValue(listOutput, proxy, { abort: processes.abort });
+							}
+
+							await sendFinish(listOutput, { abort: processes.abort });
+							break;
+						}
+
+						case 'add_service': {
+							queryAddService.run({
+								$host: request.host ?? null,
+								$port: request.port,
+								$name: request.name,
+							});
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'remove_service': {
+							queryRemoveService.run({
+								$name: request.name,
+							});
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'add_remote': {
+							queryAddRemote.run({
+								$publicKey: request.publicKey,
+							});
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'remove_remote': {
+							queryRemoveRemote.run({
+								$publicKey: request.publicKey,
+							});
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'add_server': {
+							queryAddServer.run({
+								$name: request.name,
+								$publicKey: request.publicKey,
+							});
+							// In case a previous server with a different name was overwritten
+							proxyManager.removeProxiesByServer(request.name);
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'remove_server': {
+							queryRemoveServer.run({
+								$name: request.name,
+							});
+							proxyManager.removeProxiesByServer(request.name);
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'list': {
+							const row = queryGetServerByName.get({
+								$name: request.serverName,
+							}) as (undefined | {
+								publicKey: Uint8Array,
+							});
+							if (!row) {
+								throw new Error('Server does not exist');
+							}
+
+							const { writePin: requestOutput, readPin: commandInput } = createPipe<Uint8Array>();
+							// Stream the result directly to the write pin
+							const commandOutput = writePin;
+
+							// Connect to server
+							using socketStack = new DisposableStack();
+							const socketConn = socketStack.adopt(node.connect(row.publicKey, {
+								keyPair,
+							}), (r) => {
+								r.destroy();
+							});
+							socketConn.on('error', (error: unknown) => {
+								// The default behavior for `EventEmitter` is to crash the VM if an error
+								// is emitted without a handler. This handler pre-emptively prevents this
+								console.log('Request socket error', error);
+							});
+
+							await using processesConn = new Processes({ abort: processes.abort });
+
+							processesConn.run(async () => {
+								await processReadable(socketConn, commandOutput, { abort: processesConn.abort });
+							});
+
+							processesConn.run(async () => {
+								await processWritable(commandInput, socketConn, { abort: processesConn.abort });
+							});
 
 							// Send the request packet
-							await sendServerRequest(commandWritePin, {
+							await sendServerRequest(requestOutput, {
 								type: 'list',
-							}, optionsConn);
+							}, { abort: processesConn.abort });
 
-							await sendFinish(commandWritePin, optionsConn);
-						}, optionsProc);
+							await sendFinish(requestOutput, { abort: processesConn.abort });
+
+							await processesConn.finish();
+
+							break;
+						}
+
+						case 'proxy': {
+							const row = queryGetServerByName.get({
+								$name: request.serverName,
+							}) as (undefined | {
+								publicKey: Uint8Array,
+							});
+							if (!row) {
+								throw new Error('Server does not exist');
+							}
+
+							const port = await proxyManager.addProxy(node, keyPair, request.serverName, row.publicKey, request.serviceName, request.port);
+							await sendCmdResponse(writePin, {
+								type: 'proxy',
+								port,
+							}, { abort: processes.abort });
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
+
+						case 'unproxy': {
+							proxyManager.removeProxyByPort(request.port);
+							await sendFinish(writePin, { abort: processes.abort });
+							break;
+						}
 					}
-					finally {
-						socketConn.destroy();
-					}
 
-					break;
+					await processes.finish();
 				}
-
-				case 'proxy': {
-					const row = queryGetServerByName.get({
-						$name: request.serverName,
-					}) as (undefined | {
-						publicKey: Uint8Array,
-					});
-					if (!row) {
-						throw new Error('Server does not exist');
-					}
-
-					const port = await addProxy(node, keyPair, request.serverName, row.publicKey, request.serviceName, request.port);
-					await sendCmdResponse(writePin, {
-						type: 'proxy',
-						port,
-					}, optionsProc);
-					await sendFinish(writePin, optionsProc);
-					break;
+				catch (error) {
+					console.log(error);
 				}
-
-				case 'unproxy': {
-					removeProxyByPort(request.port);
-					await sendFinish(writePin, optionsProc);
-					break;
-				}
-			}
-
-			await sendFinish(processes, optionsProc);
-		}).catch((error: unknown) => {
-			console.log(error);
-		}).then(() => {
-			socket.destroy();
+			});
 		});
-	});
 
-	cmd.listen({
-		path: CMD_PATH,
-		readableAll: true,
-		writableAll: true,
-	});
+		cmd.listen({
+			path: CMD_PATH,
+			readableAll: true,
+			writableAll: true,
+		});
+
+		await anyAbort(abort);
+	}
+
+	console.log('Politely asking daemon to stop...');
+	try {
+		await using processesTimeout = new Processes({ abort: processesConnections.abort });
+		processesTimeout.run(async () => {
+			await waitTimeout(10000, { abort: processesTimeout.abort });
+			throw new Error('Timed out being polite');
+		});
+		await processesConnections.finish({ abort: processesTimeout.abort });
+	}
+	catch {
+	}
+	if (!processesConnections.finished) {
+		console.log('Being less polite...');
+	}
 }
 
-async function runCommand(input: PipeReadPin<Uint8Array>, output: PipeWritePin<Uint8Array>, options?: {
+async function runCommand(input: PipeReadPin<Uint8Array>, output: PipeWritePin<Uint8Array>, options: {
 	abort?: Abort,
-}): Promise<void> {
-	const socket = createConnection(CMD_PATH);
+} = {}): Promise<void> {
+	await using socket = createConnection(CMD_PATH);
+	await using processes = new Processes({ abort: options.abort })
 
-	try {
-		await runProcesses(async (processes, optionsProc = {}) => {
-			// Bridge connection
-			await sendValue(processes, async (optionsWrite) => {
-				await processReadable(socket, output, optionsWrite);
-			}, optionsProc);
+	// Bridge connection
+	processes.run(async () => {
+		await processReadable(socket, output, { abort: processes.abort });
+	});
 
-			await sendFinish(processes, optionsProc)
+	await processWritable(input, socket, { abort: processes.abort });
 
-			await processWritable(input, socket, optionsProc);
-		}, options);
-	}
-	finally {
-		socket.destroy();
-	}
+	await processes.finish();
 }
 
 function printKey(publicKey: Uint8Array): void {
@@ -659,227 +679,207 @@ function printKey(publicKey: Uint8Array): void {
 	console.log([...chunk(entropyToMnemonic(publicKey, wordlist).split(' ').map(x => x.padEnd(8)), 4).map(x => x.join(' '))].join('\n'));
 }
 
-async function app(): Promise<void> {
+async function app(abort: Abort): Promise<void> {
 	if (argv[2] === 'daemon') {
-		return await daemon(argv[3] === 'noserve');
+		return await daemon(argv[3] === 'noserve', abort);
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'key') {
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'show_key',
-			}, optionsProc);
-
-			// Print result
-			const result = await receiveCmdResponse(readPin, 'show_key', optionsProc);
-			printKey(result.publicKey);
-
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'show_key',
+		}, { abort: processes.abort });
+
+		// Print result
+		const result = await receiveCmdResponse(readPin, 'show_key', { abort: processes.abort });
+		printKey(result.publicKey);
+
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'services') {
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin: listDecodeInput } = createPipe<Uint8Array>();
+		const { writePin: listDecodeOutput, readPin: listInput } = createPipe<{
+			name: Uint8Array,
+			host?: string,
+			port: number,
+		}>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'show_services',
-			}, optionsProc);
-
-			// Receive list
-			const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
-				name: Uint8Array,
-				host?: string,
-				port: number,
-			}>();
-
-			await sendValue(processes, async (options) => {
-				await receiveCmdServiceList(readPin, listWritePin, options);
-			}, optionsProc);
-
-			// Print result
-			while (true) {
-				const result = await receiveValue(listReadPin, optionsProc);
-				if (result.done) {
-					break;
-				}
-				const {
-					name,
-					host,
-					port,
-				} = result.value;
-				if (host) {
-					console.log(`${ host } ${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
-				}
-				else {
-					console.log(`${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
-				}
-			}
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'show_services',
+		}, { abort: processes.abort });
+
+		// Receive list
+		processes.run(async () => {
+			await receiveCmdServiceList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
+		});
+
+		// Print result
+		for await (const {
+			name,
+			host,
+			port,
+		} of toAsyncIterable(listInput, { abort: processes.abort })) {
+			if (host) {
+				console.log(`${ host } ${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
+			}
+			else {
+				console.log(`${ port.toString().padStart(8) } ${ Buffer.from(name).toString() }`);
+			}
+		}
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'allowed') {
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin: listDecodeInput } = createPipe<Uint8Array>();
+		const { writePin: listDecodeOutput, readPin: listInput } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'show_remotes',
-			}, optionsProc);
-
-			// Receive list
-			const { readPin: listReadPin, writePin: listWritePin } = createPipe<Uint8Array>();
-
-			await sendValue(processes, async (options) => {
-				await receiveCmdRemoteList(readPin, listWritePin, options);
-			}, optionsProc);
-
-			// Print result
-			const first = await receiveValue(listReadPin, optionsProc);
-			if (first.done) {
-				// Finish must be delayed until after read, because pipes can't be half-closed
-				await sendFinish(writePin, optionsProc);
-				return;
-			}
-
-			printKey(first.value);
-
-			while (true) {
-				const result = await receiveValue(listReadPin, optionsProc);
-				if (result.done) {
-					break;
-				}
-				console.log();
-				printKey(result.value);
-			}
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'show_remotes',
+		}, { abort: processes.abort });
+
+		// Receive list
+		processes.run(async () => {
+			await receiveCmdRemoteList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
+		});
+
+		// Print result
+		for await (const publicKey of toAsyncIterable(listInput, { abort: processes.abort, sendStop: 'never' })) {
+			printKey(publicKey);
+			break;
+		}
+		for await (const publicKey of toAsyncIterable(listInput, { abort: processes.abort })) {
+			console.log();
+			printKey(publicKey);
+		}
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'servers') {
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin: listDecodeInput } = createPipe<Uint8Array>();
+		const { writePin: listDecodeOutput, readPin: listInput } = createPipe<{
+			name: string,
+			publicKey: Uint8Array,
+		}>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'show_servers',
-			}, optionsProc);
-
-			// Receive list
-			const { readPin: listReadPin, writePin: listWritePin } = createPipe<{
-				name: string,
-				publicKey: Uint8Array,
-			}>();
-
-			await sendValue(processes, async (options) => {
-				await receiveCmdServerList(readPin, listWritePin, options);
-			}, optionsProc);
-
-			// Print result
-			const first = await receiveValue(listReadPin, optionsProc);
-			if (first.done) {
-				// Finish must be delayed until after read, because pipes can't be half-closed
-				await sendFinish(writePin, optionsProc);
-				return;
-			}
-
-			console.log(`Name: ${ first.value.name }`);
-			printKey(first.value.publicKey);
-
-			while (true) {
-				const result = await receiveValue(listReadPin, optionsProc);
-				if (result.done) {
-					break;
-				}
-				console.log();
-				console.log(`Name: ${ result.value.name }`);
-				printKey(result.value.publicKey);
-			}
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'show_servers',
+		}, { abort: processes.abort });
+
+		// Receive list
+		processes.run(async () => {
+			await receiveCmdServerList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
+		});
+
+		// Print result
+		for await (const { name, publicKey } of toAsyncIterable(listInput, { abort: processes.abort, sendStop: 'never' })) {
+			console.log(`Name: ${ name }`);
+			printKey(publicKey);
+			break;
+		}
+		for await (const { name, publicKey } of toAsyncIterable(listInput, { abort: processes.abort })) {
+			console.log();
+			console.log(`Name: ${ name }`);
+			printKey(publicKey);
+		}
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'show' && argv[3] === 'proxies') {
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		const decoder = new TextDecoder('utf-8');
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin: listDecodeInput } = createPipe<Uint8Array>();
+		const { writePin: listDecodeOutput, readPin: listInput } = createPipe<ActiveProxy>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'show_proxies',
-			}, optionsProc);
-
-			// Receive list
-			const { readPin: listReadPin, writePin: listWritePin } = createPipe<ActiveProxy>();
-
-			await sendValue(processes, async (options) => {
-				await receiveCmdProxyList(readPin, listWritePin, options);
-			}, optionsProc);
-
-			// Print result
-			const first = await receiveValue(listReadPin, optionsProc);
-			if (first.done) {
-				// Finish must be delayed until after read, because pipes can't be half-closed
-				await sendFinish(writePin, optionsProc);
-				return;
-			}
-
-			console.log(`Port: ${ first.value.port }`);
-			console.log(`Server: ${ first.value.serverName }`);
-			console.log(`Service: ${ Buffer.from(first.value.serviceName).toString() }`);
-
-			while (true) {
-				const result = await receiveValue(listReadPin, optionsProc);
-				if (result.done) {
-					break;
-				}
-				console.log();
-				console.log(`Port: ${ result.value.port }`);
-				console.log(`Server: ${ result.value.serverName }`);
-				console.log(`Service: ${ Buffer.from(result.value.serviceName).toString() }`);
-			}
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'show_proxies',
+		}, { abort: processes.abort });
+
+		// Receive list
+		processes.run(async () => {
+			await receiveCmdProxyList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
+		});
+
+		// Print result
+		for await (const { port, serverName, serviceName } of toAsyncIterable(listInput, { abort: processes.abort, sendStop: 'never' })) {
+			console.log(`Port: ${ port }`);
+			console.log(`Server: ${ serverName }`);
+			console.log(`Service: ${ decoder.decode(serviceName) }`);
+			break;
+		}
+		for await (const { port, serverName, serviceName } of toAsyncIterable(listInput, { abort: processes.abort })) {
+			console.log();
+			console.log(`Port: ${ port }`);
+			console.log(`Server: ${ serverName }`);
+			console.log(`Service: ${ decoder.decode(serviceName) }`);
+		}
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'add') {
@@ -910,32 +910,35 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, host === null ? {
-				type: 'add_service',
-				port,
-				name: nameBuf,
-			} : {
-				type: 'add_service',
-				host,
-				port,
-				name: nameBuf,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, host === null ? {
+			type: 'add_service',
+			port,
+			name: nameBuf,
+		} : {
+			type: 'add_service',
+			host,
+			port,
+			name: nameBuf,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'remove') {
@@ -949,26 +952,29 @@ async function app(): Promise<void> {
 		}
 		const nameBuf = Buffer.from(name);
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'remove_service',
-				name: nameBuf,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'remove_service',
+			name: nameBuf,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'allow') {
@@ -991,26 +997,29 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'add_remote',
-				publicKey,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'add_remote',
+			publicKey,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'deny') {
@@ -1033,26 +1042,29 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'remove_remote',
-				publicKey,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'remove_remote',
+			publicKey,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'register') {
@@ -1083,27 +1095,30 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'add_server',
-				name,
-				publicKey,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'add_server',
+			name,
+			publicKey,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'unregister') {
@@ -1116,29 +1131,33 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'remove_server',
-				name,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'remove_server',
+			name,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'list') {
+		const decoder = new TextDecoder('utf-8');
 		const serverName = argv.slice(3).join(' ').trim();
 		if (serverName === '') {
 			console.log('Please specify the name of the server');
@@ -1148,39 +1167,37 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin: listDecodeInput } = createPipe<Uint8Array>();
+		const { writePin: listDecodeOutput, readPin: listInput } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'list',
-				serverName,
-			}, optionsProc);
-
-			// Receive list
-			const { readPin: listReadPin, writePin: listWritePin } = createPipe<Uint8Array>();
-
-			await sendValue(processes, async (options) => {
-				await receiveServerServiceList(readPin, listWritePin, options);
-			}, optionsProc);
-
-			// Print result
-			while (true) {
-				const result = await receiveValue(listReadPin, optionsProc);
-				if (result.done) {
-					break;
-				}
-				console.log(`${ Buffer.from(result.value).toString() }`);
-			}
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'list',
+			serverName,
+		}, { abort: processes.abort });
+
+		// Receive list
+		processes.run(async () => {
+			await receiveServerServiceList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
+		});
+
+		// Print result
+		for await (const serviceName of toAsyncIterable(listInput, { abort: processes.abort })) {
+			console.log(`${ decoder.decode(serviceName) }`);
+		}
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'connect') {
@@ -1201,33 +1218,37 @@ async function app(): Promise<void> {
 			console.log('  connect <server name> <service name>');
 			return;
 		}
-		const serviceNameBuf = Buffer.from(serviceName);
+		const encoder = new TextEncoder();
+		const serviceNameBuf = encoder.encode(serviceName);
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'proxy',
-				serverName,
-				serviceName: serviceNameBuf,
-				port: 0,
-			}, optionsProc);
-
-			// Print result
-			const result = await receiveCmdResponse(readPin, 'proxy', optionsProc);
-			console.log(`Proxy listening on port ${ result.port }`);
-
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'proxy',
+			serverName,
+			serviceName: serviceNameBuf,
+			port: 0,
+		}, { abort: processes.abort });
+
+		// Print result
+		const result = await receiveCmdResponse(readPin, 'proxy', { abort: processes.abort });
+		console.log(`Proxy listening on port ${ result.port }`);
+
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'port' && argv[4] === 'connect') {
@@ -1256,7 +1277,8 @@ async function app(): Promise<void> {
 			console.log('  port <port> connect <server name> <service name>');
 			return;
 		}
-		const serviceNameBuf = Buffer.from(serviceName);
+		const encoder = new TextEncoder();
+		const serviceNameBuf = encoder.encode(serviceName);
 
 		const port = parseInt(argv[3]);
 		if (port < 1 || port > 65535) {
@@ -1264,31 +1286,34 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'proxy',
-				serverName,
-				serviceName: serviceNameBuf,
-				port,
-			}, optionsProc);
-
-			// Print result
-			const result = await receiveCmdResponse(readPin, 'proxy', optionsProc);
-			console.log(`Proxy listening on port ${ result.port }`);
-
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'proxy',
+			serverName,
+			serviceName: serviceNameBuf,
+			port,
+		}, { abort: processes.abort });
+
+		// Print result
+		const result = await receiveCmdResponse(readPin, 'proxy', { abort: processes.abort });
+		console.log(`Proxy listening on port ${ result.port }`);
+
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'disconnect') {
@@ -1306,26 +1331,29 @@ async function app(): Promise<void> {
 			return;
 		}
 
-		return await runProcesses(async (processes, optionsProc) => {
-			const { readPin, writePin: commandWritePin } = createPipe<Uint8Array>();
-			const { readPin: commandReadPin, writePin } = createPipe<Uint8Array>();
+		await using processes = new Processes({ abort });
 
-			await sendValue(processes, async (options) => {
-				await runCommand(commandReadPin, commandWritePin, options);
-			}, optionsProc);
+		const { writePin, readPin: commandInput } = createPipe<Uint8Array>();
+		const { writePin: commandOutput, readPin } = createPipe<Uint8Array>();
 
-			// Send command
-			await sendCmdRequest(writePin, {
-				type: 'unproxy',
-				port,
-			}, optionsProc);
-
-			// No result
-			await receiveStop(readPin);
-
-			// Finish must be delayed until after read, because pipes can't be half-closed
-			await sendFinish(writePin, optionsProc);
+		processes.run(async () => {
+			await runCommand(commandInput, commandOutput, { abort: processes.abort });
 		});
+
+		// Send command
+		await sendCmdRequest(writePin, {
+			type: 'unproxy',
+			port,
+		}, { abort: processes.abort });
+
+		// No result
+		await receiveStop(readPin, { abort: processes.abort });
+
+		// Finish must be delayed until after read, because pipes can't be half-closed
+		await sendFinish(writePin, { abort: processes.abort });
+
+		await processes.finish();
+		return;
 	}
 
 	if (argv[2] === 'licenses') {
@@ -1403,4 +1431,9 @@ async function app(): Promise<void> {
 	console.log('    Display licenses of libraries used in this software');
 }
 
-await app();
+const userAbort = new Abort();
+const userAbortError = new Error('User interrupt received');
+process.once('SIGINT', () => userAbort.abort(userAbortError));
+process.once('SIGTERM', () => userAbort.abort(userAbortError));
+
+await app(userAbort);

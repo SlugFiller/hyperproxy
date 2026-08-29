@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -14,12 +16,12 @@
  */
 
 import {
+	type Types,
+} from '@callstack/licenses';
+import {
 	scanDependencies,
 	writeAboutLibrariesNPMOutput,
 } from '@callstack/licenses/node';
-import type {
-	Types,
-} from '@callstack/licenses';
 import {
 	chdir,
 } from 'node:process';

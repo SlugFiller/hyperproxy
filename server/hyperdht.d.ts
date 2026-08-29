@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -112,6 +114,7 @@ declare module 'hyperdht' {
 
 	class Server extends EventEmitter<ServerEvents> {
 		listen(keyPair: KeyPair, opts?: AnnouncerOptions);
+		close(): Promise<void>;
 	}
 
 	class HyperDHT {

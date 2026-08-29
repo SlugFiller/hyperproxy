@@ -55,7 +55,7 @@ COPY ./app /usr/src/app/
 
 RUN npx tsc -p backend
 
-RUN npx bare-pack --target android --linked --out ./backend.bundle.mjs backend/dist/backend/backend.js
+RUN npx bare-pack --host android --linked --out ./backend.bundle.mjs backend/dist/backend/backend.js
 
 RUN npx tsc --noEmit
 
@@ -91,7 +91,7 @@ WORKDIR /usr/src/app
 
 RUN npx tsc -p backend
 
-RUN npx bare-pack --target android --linked --out ./backend.bundle.mjs backend/dist/backend/backend.js
+RUN npx bare-pack --host android --linked --out ./backend.bundle.mjs backend/dist/backend/backend.js
 
 RUN npx tsc --noEmit
 

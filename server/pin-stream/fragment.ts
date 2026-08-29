@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,24 +15,28 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from './abort.ts';
 import {
+	type PipeReadPin,
+	type PipeWritePin,
 	receiveStop,
 	receiveValue,
 	sendValue,
 	waitUntilCanSend,
 } from './pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
-} from './pin-stream.ts';
 
-// Fragments buffers read from `input` that are larger than `size` into smaller
-// packets and writes them to `output`
-// Throws if `abort` is aborted
-// `size` is 65535 by default
+/**
+ * Fragments buffers read from `input` that are larger than `size` into smaller
+ * packets and writes them to `output`.
+ *
+ * @param input - Incoming stream of buffers which may be any size.
+ * @param output - Outgoing stream of buffers which will have a size of `size` or smaller.
+ * @param [options] - Additional options.
+ * @param [options.size=65535] - The size to which buffers should be split.
+ * @param [options.abort] - If aborted, stops processing and throws.
+ */
 export async function fragmentPackets(input: PipeReadPin<Uint8Array>, output: PipeWritePin<Uint8Array>, options: {
 	size?: number,
 	abort?: Abort,

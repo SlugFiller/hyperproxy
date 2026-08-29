@@ -1,4 +1,6 @@
-/**
+/*
+ * SPDX-License-Identifier: 0BSD
+ *
  * BSD Zero Clause License
  *
  * Permission to use, copy, modify, and/or distribute this software for
@@ -13,41 +15,64 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import type {
-	Abort,
+import {
+	type Abort,
 } from './abort.ts';
 import {
+	type PipeReadPin,
+	type PipeWritePin,
 	receiveStop,
 	receiveValue,
+	sendValue,
 	waitUntilCanSend,
 } from './pin-stream.ts';
-import type {
-	PipeReadPin,
-	PipeWritePin,
-} from './pin-stream.ts';
 
-// Type for processing a packet from a buffer
-export type PacketProcessResult<T> = {
-	// The buffer is consistent with a prefix of a packet, but more bytes are necessary for a full packet
-	complete: false,
-} | {
-	// The start of the buffer matches the desired packet format, and contains a full packet
-	complete: true,
-	packet: T,
-	// The number of bytes making up the packet inside the buffer
-	// If the packet exactly ends on the buffer's last byte, this is equal to the buffer's length
-	bytesUsed: number,
-};
+/**
+ * The buffer is consistent with a prefix of a packet, but more bytes are necessary for a full packet.
+ */
+export interface PacketProcessResultIncomplete {
+	complete: false;
+}
 
-// Reads a packet from `input`, correctly handling the case where the packet spans multiple buffers
-// Throws if `abort` is aborted during processing
-// On return, if the last buffer received from `input` does not end on the last byte of the packet,
-// `input` will remain in `has_value` state with the remainder of the buffer as its value
-// Otherwise, `input` will be in the `idle` state
-// `packetProcessor` is repeatedly passed candidate buffers for the packet so long as it returns `complete: false`
-// It may throw if it detects the buffer cannot be a prefix of a packet
-// In such a case the function will throw as well
-// If it returns `complete: true`, the returned value is returned from the function
+/**
+ * The start of the buffer matches the desired packet format, and contains a full packet.
+ */
+export interface PacketProcessResultSuccess<T> {
+	complete: true;
+	/**
+	 * The parsed packet.
+	 */
+	packet: T;
+	/**
+	 * The number of bytes making up the packet inside the buffer.
+	 * If the packet exactly ends on the buffer's last byte, this is equal to the buffer's length.
+	 */
+	bytesUsed: number;
+}
+
+/**
+ * The result of an attempt to parse a packet from a buffer. There's no state for a failed parse,
+ * since an error should be thrown in that case. There are only states for successful or partially
+ * successful parsing.
+ */
+export type PacketProcessResult<T> = PacketProcessResultIncomplete  | PacketProcessResultSuccess<T>;
+
+/**
+ * Reads a packet from `input`, correctly handling the case where the packet spans multiple buffers.
+ * On return, if the last buffer received from `input` does not end on the last byte of the packet,
+ * `input` will remain in `has_value` state with the remainder of the buffer as its value.
+ * Otherwise, `input` will be in the `idle` state.
+ * `packetProcessor` is repeatedly passed candidate buffers for the packet so long as it returns `complete: false`.
+ * It may throw if it detects the buffer cannot be a prefix of a packet.
+ * In such a case the function will throw as well.
+ * If it returns `complete: true`, the returned value is returned from the function.
+ *
+ * @param input - The readable stream from which to read a packet.
+ * @param packetProcessor - A callback that receives packet candidates, and attempts to parse them into a packet.
+ * @param [options] - Additional options.
+ * @param [options.abort] - If aborted, stops trying to read a packet and throws.
+ * @returns The parsed packet.
+ */
 export async function readPacket<T>(input: PipeReadPin<Uint8Array>, packetProcessor: (buffer: Uint8Array) => Promise<PacketProcessResult<T>>, options: {
 	abort?: Abort,
 } = {}): Promise<T> {
@@ -88,15 +113,24 @@ export async function readPacket<T>(input: PipeReadPin<Uint8Array>, packetProces
 		}
 
 		// Packet is not complete yet, continue reading
-		input.gotValue(); // Consume the current value since we processed it
+		// Consume the current value since we processed it
+		input.gotValue();
 		continue;
 	}
 }
 
-// Reads packets from `input` and writes them to `output`
-// See `readPacket` for details about `packetProcessor`
-// Throws if `input` ends mid-packet
-// Throws if `abort` is aborted during processing
+/**
+ * Reads packets from `input` and writes them to `output`.
+ * See {@link readPacket} for details about `packetProcessor`.
+ * Throws if `input` ends mid-packet.
+ * Exits cleanly if `input` ends exactly on a packet boundary.
+ *
+ * @param input - The readable stream from which to read packets as bytes.
+ * @param output - The writable stream to which to write packets as decoded value.
+ * @param packetProcessor - A callback that receives packet candidates, and attempts to parse them into a packet.
+ * @param [options] - Additional options.
+ * @param [options.abort] - If aborted, stops trying to read packets and throws.
+ */
 export async function decodePacketStream<T>(input: PipeReadPin<Uint8Array>, output: PipeWritePin<T>, packetProcessor: (buffer: Uint8Array) => Promise<PacketProcessResult<T>>, options: {
 	abort?: Abort,
 } = {}): Promise<void> {
@@ -124,7 +158,7 @@ export async function decodePacketStream<T>(input: PipeReadPin<Uint8Array>, outp
 		if (done) {
 			// Input finished
 			output.finish();
-			return;
+			break;
 		}
 		const packet = await readPacket(input, packetProcessor, {
 			abort,
@@ -136,30 +170,42 @@ export async function decodePacketStream<T>(input: PipeReadPin<Uint8Array>, outp
 	}
 }
 
-// Reads packets from `input` and writes them to `output` after being transformed by `transform`
-// Throws if `abort` is aborted during processing
-export async function transformPacketStream<I, O>(input: PipeReadPin<I>, output: PipeWritePin<O>, transform: (inputPacket: I) => Promise<O>, options?: {
+/**
+ * Reads packets from `input` and writes them to `output` after being transformed by `transform`.
+ *
+ * @param input - The readable stream from which to read packets.
+ * @param output - The writable stream to which to write transformed packets.
+ * @param transform - A callback that receives a read packet and returns a transformed packet to be written.
+ * @param [options] - Additional options.
+ * @param [options.abort] - If aborted, stops processing and throws.
+ */
+export async function transformPacketStream<I, O>(input: PipeReadPin<I>, output: PipeWritePin<O>, transform: (inputPacket: I) => Promise<O>, options: {
 	abort?: Abort,
-}): Promise<void> {
+} = {}): Promise<void> {
+	const {
+		abort,
+	} = options;
+
 	while (true) {
 		// Produce nothing until a read is requested
-		if (!await waitUntilCanSend(output, options)) {
+		if (!await waitUntilCanSend(output, { abort })) {
 			// Output does not want more messages
-			await receiveStop(input, options);
+			await receiveStop(input, { abort });
 			break;
 		}
 
 		// Read packet to transform
-		const result = await receiveValue(input, options);
+		const result = await receiveValue(input, { abort, consumeValue: false });
 		if (result.done) {
 			// Input finished
 			output.finish();
-			return;
+			break;
 		}
 		const packet = await transform(result.value);
 
 		// Send the transformed packet
-		// We can use `setValue` directly because we already guaranteed `output` is ready above
-		output.setValue(packet);
+		await sendValue(output, packet, { abort, waitConsume: true });
+		// Output consumed value. Report back to input
+		input.gotValue();
 	}
 }
