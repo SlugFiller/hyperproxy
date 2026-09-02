@@ -11,10 +11,6 @@ services:
   debug:
     build:
       target: metro
-    develop:
-      watch:
-        - action: rebuild
-          path: ./app
     ports:
       - ${METRO_PORT:-8081}:8081
   generate-keystore:

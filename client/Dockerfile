@@ -51,17 +51,9 @@ FROM package-lock AS metro
 
 WORKDIR /usr/src/app
 
-COPY ./app /usr/src/app/
+COPY ./app/metro.config.ts /usr/src/app
 
-RUN npx tsc -p backend
-
-RUN npx bare-pack --host android --linked --out ./backend.bundle.mjs backend/dist/backend/backend.js
-
-RUN npx tsc --noEmit
-
-RUN npm run lint
-
-CMD ["npm", "run", "start"]
+CMD ["sh", "-c", "trap 'exit 0' INT TERM; sleep infinity & wait"]
 
 FROM package-lock AS keygen
 
