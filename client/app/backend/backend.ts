@@ -135,7 +135,7 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 				port: await proxyManager.addOrGetProxy(node, {
 					publicKey: request.publicKey,
 					secretKey: request.secretKey,
-				}, request.serverKey, request.serviceName, request.port),
+				}, request.serverKey, request.serviceName, request.port, options?.abort),
 			}, options);
 			await sendFinish(writePin, options);
 			break;
@@ -150,7 +150,7 @@ async function handleRequest(readPin: PipeReadPin<Uint8Array>, writePin: PipeWri
 		case 'is_proxy': {
 			await sendRPCResponse(writePin, {
 				type: 'is_proxy',
-				port: proxyManager.getProxy(request.serverKey, request.serviceName),
+				port: await proxyManager.getProxy(request.serverKey, request.serviceName, options?.abort),
 			});
 			await sendFinish(writePin, options);
 			break;

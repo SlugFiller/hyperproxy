@@ -76,7 +76,7 @@ export class ProxyManager {
 	async addProxy(node: DHT, keyPair: {
 		publicKey: Uint8Array,
 		secretKey: Uint8Array,
-	}, serverName: string, serverKey: Uint8Array, serviceName: Uint8Array, port: number): Promise<number> {
+	}, serverName: string, serverKey: Uint8Array, serviceName: Uint8Array, port: number, abort?: Abort): Promise<number> {
 		const errorAbort = new Abort();
 		const result = new Eventual<number>();
 		this.#processes.run(async () => {
@@ -97,7 +97,10 @@ export class ProxyManager {
 				processesProxy.run(async () => {
 					await runProxy(finalPort, node, keyPair, serverKey, serviceName, port, processesProxy.abort);
 				});
-				proxy.port = await finalPort.getValue({ abort: processesProxy.abort });
+				{
+					await using processesAbort = new Processes({ aborts: [processesProxy.abort, abort] });
+					proxy.port = await finalPort.getValue({ abort: processesAbort.abort });
+				}
 
 				// Add proxy to active list
 				if (this.#activeProxiesByPort.has(proxy.port)) {
@@ -171,9 +174,12 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 	const localStreams = createPipe<StreamSplitterStream>();
 	const localStreamsUnrace = new Unrace();
 	await using processesProxy = new Processes({ abort });
+	const remoteReady = new Abort();
 
 	async function retry() {
 		try {
+			const remoteError = new Abort();
+			const remoteConnect = new Abort();
 			using remoteStack = new DisposableStack();
 			const remote = remoteStack.adopt(node.connect(serverKey, { keyPair }), (r) => {
 				r.destroy();
@@ -182,7 +188,21 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 				// The default behavior for `EventEmitter` is to crash the VM if an error
 				// is emitted without a handler. This handler pre-emptively prevents this
 				console.log('Proxy socket error', error);
+				remoteError.abort(error);
 			});
+			remote.once('connect', () => {
+				remoteConnect.abort();
+			});
+
+			await anyAbort(remoteConnect, remoteError, processesProxy.abort);
+			if (processesProxy.abort.aborted) {
+				throw processesProxy.abort.reason;
+			}
+			if (remoteError.aborted) {
+				throw remoteError.reason;
+			}
+
+			remoteReady.abort();
 
 			// Manage connection to server
 			await using processes = new Processes({ abort: processesProxy.abort });
@@ -221,6 +241,10 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 			if (processesProxy.abort.aborted) {
 				return;
 			}
+			if (!remoteReady.aborted) {
+				// Failed on first attempt, do not retry
+				throw new Error('Failed to connect to proxy');
+			}
 
 			// Connection failed or unexpectedly disconnected
 			// Wait 5 seconds
@@ -234,12 +258,25 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 	// Spawn connection
 	processesProxy.run(retry);
 
+	// Wait for the proxy to connect at least once
+	// It may disconnect and automatically reconnect later
+	await anyAbort(remoteReady, processesProxy.abort);
+	if (processesProxy.abort.aborted) {
+		throw processesProxy.abort.reason;
+	}
+
 	// Listen for incoming connections
+	const serverError = new Abort();
+	const serverListening = new Abort();
 	await using server = createServer();
 	server.on('error', (error: unknown) => {
 		// The default behavior for `EventEmitter` is to crash the VM if an error
 		// is emitted without a handler. This handler pre-emptively prevents this
 		console.log('Listener error', error);
+		serverError.abort(error);
+	});
+	server.once('listening', () => {
+		serverListening.abort();
 	});
 	server.on('connection', (socket) => {
 		socket.on('error', (error: unknown) => {
@@ -255,7 +292,7 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 				socketStack.adopt(socket, (r) => {
 					r.destroy();
 				});
-				await using processes = new Processes({ abort });
+				await using processes = new Processes({ abort: processesProxy.abort });
 				const {
 					abort: remoteAbort,
 				} = processes;
@@ -295,21 +332,14 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 	});
 
 	// Listen only on localhost, on the specified port, or on a random port if the port is 0
-	await new Promise<void>((resolve, reject) => {
-		function onListening() {
-			server.off('listening', onListening);
-			server.off('error', onError);
-			resolve();
-		}
-		function onError(error: unknown) {
-			server.off('listening', onListening);
-			server.off('error', onError);
-			reject(error);
-		}
-		server.on('listening', onListening);
-		server.on('error', onError);
-		server.listen(port, '127.0.0.1');
-	});
+	server.listen(port, '127.0.0.1');
+	await anyAbort(serverListening, serverError, processesProxy.abort);
+	if (processesProxy.abort.aborted) {
+		throw processesProxy.abort.reason;
+	}
+	if (serverError.aborted) {
+		throw serverError.reason;
+	}
 	const address = server.address();
 	if (address === null || typeof address !== 'object') {
 		throw new Error('Failed to retrieve bound address for listener');

@@ -596,7 +596,7 @@ async function daemon(noServe: boolean, abort: Abort): Promise<void> {
 								throw new Error('Server does not exist');
 							}
 
-							const port = await proxyManager.addProxy(node, keyPair, request.serverName, row.publicKey, request.serviceName, request.port);
+							const port = await proxyManager.addProxy(node, keyPair, request.serverName, row.publicKey, request.serviceName, request.port, processes.abort);
 							await sendCmdResponse(writePin, {
 								type: 'proxy',
 								port,
