@@ -22,7 +22,6 @@ import {
 import {
 	wordlist,
 } from '@scure/bip39/wordlists/english.js';
-import b4a from 'b4a';
 import {
 	Children,
 	type ComponentPropsWithoutRef,
@@ -252,7 +251,11 @@ const AppContent: FC = () => {
 					return;
 				}
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 		});
@@ -391,7 +394,11 @@ const AppContent: FC = () => {
 		}
 		catch (error) {
 			if (error instanceof Error) {
-				Toast.error(error.message);
+				let current = error;
+				while (current.cause instanceof Error) {
+					current = current.cause;
+				}
+				Toast.error(current.message);
 			}
 		}
 	}, [serverName, phrase, setServerListReload]);
@@ -410,7 +417,11 @@ const AppContent: FC = () => {
 		}
 		catch (error) {
 			if (error instanceof Error) {
-				Toast.error(error.message);
+				let current = error;
+				while (current.cause instanceof Error) {
+					current = current.cause;
+				}
+				Toast.error(current.message);
 			}
 		}
 	}, [serverName, phrase, setServerListReload, setSelectedView]);
@@ -464,7 +475,11 @@ const AppContent: FC = () => {
 			}
 			catch (error) {
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 			finally {
@@ -686,7 +701,11 @@ const LicensesView: FC<{ processesGlobal: Processes }> = ({ processesGlobal }) =
 					return;
 				}
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 		});
@@ -890,8 +909,9 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 					await receiveServerServiceList(listDecodeInput, listDecodeOutput, { abort: processes.abort });
 				});
 
+				const decoder = new TextDecoder('utf-8');
 				for await (const serviceName of toAsyncIterable(serviceListReadPin, { abort: processes.abort })) {
-					const service = b4a.toString(serviceName);
+					const service = decoder.decode(serviceName);
 					gotServices.push(service);
 					setServices([...gotServices]);
 				}
@@ -903,7 +923,11 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 					return;
 				}
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 			finally {
@@ -1013,10 +1037,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 
 					processes.run(async () => {
 						// Write request
+						const encoder = new TextEncoder();
 						await sendRPCRequest(writePin, {
 							type: 'is_proxy',
 							serverKey,
-							serviceName: b4a.from(serviceName),
+							serviceName: encoder.encode(serviceName),
 						}, {
 							abort: processes.abort,
 							throwOnNoMore: true,
@@ -1054,7 +1079,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					return;
 				}
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 		});
@@ -1093,13 +1122,14 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					processes.run(async () => {
 						const portNum: number = portStr === '' ? 0 : parseInt(portStr, 10);
 						// Write request
+						const encoder = new TextEncoder();
 						await sendRPCRequest(writePin, {
 							type: 'proxy',
 							port: (Number.isSafeInteger(portNum) && portNum > 0 && portNum < 65536) ? portNum : 0,
 							publicKey: keyPair.publicKey,
 							secretKey: keyPair.secretKey,
 							serverKey,
-							serviceName: b4a.from(serviceName),
+							serviceName: encoder.encode(serviceName),
 						}, {
 							abort: processes.abort,
 							throwOnNoMore: true,
@@ -1126,7 +1156,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 			}
 			catch(error) {
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 		});
@@ -1155,10 +1189,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 
 					processes.run(async () => {
 						// Write request
+						const encoder = new TextEncoder();
 						await sendRPCRequest(writePin, {
 							type: 'unproxy',
 							serverKey,
-							serviceName: b4a.from(serviceName),
+							serviceName: encoder.encode(serviceName),
 						}, {
 							abort: processes.abort,
 							throwOnNoMore: true,
@@ -1182,7 +1217,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 			}
 			catch(error) {
 				if (error instanceof Error) {
-					Toast.error(error.message);
+					let current = error;
+					while (current.cause instanceof Error) {
+						current = current.cause;
+					}
+					Toast.error(current.message);
 				}
 			}
 		});
@@ -1195,7 +1234,11 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 
 		Linking.openURL(`http://localhost:${ proxyStatus.port }`).catch((error: unknown) => {
 			if (error instanceof Error) {
-				Toast.error(error.message);
+				let current = error;
+				while (current.cause instanceof Error) {
+					current = current.cause;
+				}
+				Toast.error(current.message);
 			}
 		});
 	}, [proxyStatus]);

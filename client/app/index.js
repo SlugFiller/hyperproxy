@@ -2,7 +2,7 @@
  * @format
  */
 
-import './polyfills.js';
+import './src/polyfills';
 import { AppRegistry } from 'react-native';
 import App from './src/App';
 import { runWorklet } from './src/foreground-worklet';

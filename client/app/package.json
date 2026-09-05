@@ -19,7 +19,6 @@
   },
   "dependencies": {
     "@scure/bip39": "latest",
-    "b4a": "latest",
     "bare-tcp": "latest",
     "events": "latest",
     "react": "latest",
@@ -49,7 +48,6 @@
     "@react-native/eslint-config": "latest",
     "@react-native/metro-config": "latest",
     "@react-native/typescript-config": "latest",
-    "@types/b4a": "latest",
     "@types/jest": "latest",
     "@types/react": "latest",
     "@types/react-test-renderer": "latest",

@@ -15,6 +15,7 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+import '../src/polyfills.ts';
 import {
 	type Duplex,
 } from 'bare-stream';

@@ -15,7 +15,6 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import b4a from 'b4a';
 import {
 	useEffect,
 	useState,
@@ -45,12 +44,21 @@ export async function runWorklet() {
 	const stream = new Duplex({
 		writev(buffers: Uint8Array[], callback: (err: Error | null) => void) {
 			(async () => {
-				const buffer = b4a.concat(buffers);
+				let ofs = 0;
+				for (const buf of buffers) {
+					ofs += buf.length;
+				}
+				const buffer = new Uint8Array(ofs);
+				ofs = 0;
+				for (const buf of buffers) {
+					buffer.set(buf, ofs);
+					ofs += buf.length;
+				}
 				if (buffer.byteLength <= 0) {
 					callback(null);
 					return;
 				}
-				const encoded = b4a.toString(buffer, 'base64');
+				const encoded = buffer.toBase64();
 				await ForegroundWorklet.writeWorklet(encoded)
 				callback(null);
 			})().catch(callback);
@@ -68,7 +76,7 @@ export async function runWorklet() {
 					this.push(null);
 				}
 				else {
-					this.push(b4a.from(buffer, 'base64'));
+					this.push(Uint8Array.from(atob(buffer), c => c.charCodeAt(0)));
 				}
 				callback(null);
 			})().catch(callback);
@@ -91,12 +99,21 @@ export function useForegroundWorklet() {
 		const stream = new Duplex({
 			writev(buffers: Uint8Array[], callback: (err: Error | null) => void) {
 				(async () => {
-					const buffer = b4a.concat(buffers);
+					let ofs = 0;
+					for (const buf of buffers) {
+						ofs += buf.length;
+					}
+					const buffer = new Uint8Array(ofs);
+					ofs = 0;
+					for (const buf of buffers) {
+						buffer.set(buf, ofs);
+						ofs += buf.length;
+					}
 					if (buffer.byteLength <= 0) {
 						callback(null);
 						return;
 					}
-					const encoded = b4a.toString(buffer, 'base64');
+					const encoded = buffer.toBase64();
 					await ForegroundWorklet.writeMain(encoded)
 					callback(null);
 				})().catch(callback);
@@ -114,7 +131,7 @@ export function useForegroundWorklet() {
 						this.push(null);
 					}
 					else {
-						this.push(b4a.from(buffer, 'base64'));
+						this.push(Uint8Array.from(atob(buffer), c => c.charCodeAt(0)));
 					}
 					callback(null);
 				})().catch(callback);

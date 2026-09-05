@@ -9,4 +9,4 @@ import type { MetroConfig } from '@react-native/metro-config';
  */
 const config: MetroConfig = {};
 
-export default mergeConfig(getDefaultConfig(import.meta.dirname), config);
+export default mergeConfig(getDefaultConfig((import.meta as unknown as { dirname: string }).dirname), config);
