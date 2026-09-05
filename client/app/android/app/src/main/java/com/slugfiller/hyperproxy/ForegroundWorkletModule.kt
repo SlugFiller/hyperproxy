@@ -20,6 +20,11 @@ package com.slugfiller.hyperproxy
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.appcompat.app.AlertDialog
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import java.util.concurrent.locks.ReentrantLock
@@ -31,11 +36,35 @@ class ForegroundWorkletModule(reactContext: ReactApplicationContext) : NativeFor
 
   override fun startService(): Unit {
     val context: Context = getReactApplicationContext().getApplicationContext()
+    val activity = getCurrentActivity()
 
-    // No need to actually check the return value here
-    // This is only called to give the chance for the permission to be present
-    // Even if disallowed, we can continue as normal
-    context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      when {
+        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED -> {
+          // Starting the service isn't conditioned on getting notification permissions
+          // This is only called to give the chance for the permission to be present
+          // Even if disallowed, the service still works, only without the possibility to dismiss
+        }
+        activity is MainActivity && activity.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) -> {
+          activity.requestPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        activity is MainActivity -> {
+          activity.runOnUiThread {
+            AlertDialog.Builder(activity)
+              .setTitle("Notifications Required")
+              .setMessage("If notification permission is not granted, you will not be able to dismiss the service.")
+              .setPositiveButton("Open Settings") { _, _ ->
+                activity.startActivity(Intent(
+                  Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                  Uri.fromParts("package", activity.packageName, null)
+                ))
+              }
+              .setNegativeButton("Cancel", null)
+              .show()
+          }
+        }
+      }
+    }
 
     ForegroundService.createChannel(context)
 
@@ -69,7 +98,7 @@ class ForegroundWorkletModule(reactContext: ReactApplicationContext) : NativeFor
         return
       }
       other = promiseReadWorklet!!
-	  promiseReadWorklet = null
+      promiseReadWorklet = null
     }
     other.resolve(buffer)
     result.resolve(null)
@@ -101,7 +130,7 @@ class ForegroundWorkletModule(reactContext: ReactApplicationContext) : NativeFor
         return
       }
       other = promiseReadMain!!
-	  promiseReadMain = null
+      promiseReadMain = null
     }
     other.resolve(buffer)
     result.resolve(null)

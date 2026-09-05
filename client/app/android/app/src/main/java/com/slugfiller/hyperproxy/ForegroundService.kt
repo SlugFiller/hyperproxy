@@ -20,8 +20,11 @@ package com.slugfiller.hyperproxy
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import com.facebook.react.HeadlessJsTaskService
@@ -31,11 +34,45 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class ForegroundService : HeadlessJsTaskService() {
 
+  private val dismissReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      stopForeground(STOP_FOREGROUND_REMOVE)
+      stopSelf()
+    }
+  }
+
+  override fun onCreate() {
+    super.onCreate()
+    registerReceiver(dismissReceiver, IntentFilter(ACTION_DISMISSED), RECEIVER_NOT_EXPORTED)
+  }
+
+  override fun onDestroy() {
+    unregisterReceiver(dismissReceiver)
+    super.onDestroy()
+  }
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    val deleteIntent = PendingIntent.getBroadcast(
+      this,
+      0,
+      Intent().apply {
+        action = ACTION_DISMISSED
+        setPackage(packageName)
+      },
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
+    val stopAction = Notification.Action.Builder(
+      0, "Stop", deleteIntent
+    ).build()
+
     val notificationBuilder = Notification.Builder(applicationContext, NOTIFICATION_CHANNEL_ID)
+      .setSmallIcon(R.mipmap.ic_launcher)
       .setContentTitle("HyperProxy")
       .setContentText("Proxy service running")
       .setCategory(Notification.CATEGORY_SERVICE)
+      .setDeleteIntent(deleteIntent)
+      .addAction(stopAction)
     startForeground(1, notificationBuilder.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
 
     return super.onStartCommand(intent, flags, startId)
@@ -49,6 +86,7 @@ class ForegroundService : HeadlessJsTaskService() {
   )
 
   companion object {
+    const val ACTION_DISMISSED = "com.slugfiller.hyperproxy.ACTION_DISMISSED"
     const val NOTIFICATION_CHANNEL_ID = "com.slugfiller.hyperproxy.ForegroundService"
     const val NOTIFICATION_CHANNEL_NAME = "HyperProxy"
 
