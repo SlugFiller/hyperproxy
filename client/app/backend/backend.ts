@@ -205,7 +205,12 @@ try {
 			}
 			catch (error) {
 				console.log(error);
-				localAbort?.abort(error);
+				// Drill down cause, because only the error message gets delivered to peer
+				let current = error;
+				while (typeof current === 'object' && current !== null && 'cause' in current) {
+					current = current.cause;
+				}
+				localAbort?.abort(current);
 			}
 			finally {
 				localAbort?.abort();

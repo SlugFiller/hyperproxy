@@ -246,7 +246,7 @@ const AppContent: FC = () => {
 
 				await processes.finish();
 			}
-			catch(error) {
+			catch (error) {
 				if (abort.aborted) {
 					return;
 				}
@@ -344,7 +344,7 @@ const AppContent: FC = () => {
 					]
 				);
 			}
-			catch(error) {
+			catch (error) {
 				if (abort.aborted) {
 					return;
 				}
@@ -664,13 +664,7 @@ const KeyView: FC<KeyViewProps> = ({ keyPair }) => {
 		case 'loading': return (
 			<ActivityIndicator size="large" />
 		);
-		case 'error': return (
-			<View>
-				<Text>Error</Text>
-				<Text>{keyPair.error.message}</Text>
-				<Text>{keyPair.error.stack}</Text>
-			</View>
-		);
+		case 'error': return errorFragment(keyPair.error);
 		case 'valid': return (
 			<Bip39Display
 				value={entropyToMnemonic(keyPair.publicKey, wordlist)}
@@ -696,7 +690,7 @@ const LicensesView: FC<{ processesGlobal: Processes }> = ({ processesGlobal }) =
 				}
 				setLibraries(result.data);
 			}
-			catch(error) {
+			catch (error) {
 				if (!active) {
 					return;
 				}
@@ -791,7 +785,7 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload, processesGlobal }) 
 					list,
 				});
 			}
-			catch(error) {
+			catch (error) {
 				if (!active) {
 					return;
 				}
@@ -812,13 +806,7 @@ const ServerList: FC<ServerListProps> = ({ onSelect, reload, processesGlobal }) 
 		case 'loading': return (
 			<ActivityIndicator size="large" />
 		);
-		case 'error': return (
-			<View>
-				<Text>Error</Text>
-				<Text>{serverList.error.message}</Text>
-				<Text>{serverList.error.stack}</Text>
-			</View>
-		);
+		case 'error': return errorFragment(serverList.error);
 		case 'valid': return (
 			<FlatList
 				data={serverList.list}
@@ -856,6 +844,7 @@ interface ServiceListProps {
 const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWritePin, localStreamsUnrace, onSelect, processesGlobal }) => {
 	const [services, setServices] = useState<string[]>([]);
 	const [loading, setLoading] = useState<boolean>(true);
+	const [loadError, setLoadError] = useState<Error | null>(null);
 
 	useEffect(() => {
 		if (keyPair.status !== 'valid') {
@@ -869,6 +858,7 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 			try {
 				const gotServices: string[] = [];
 				setLoading(true);
+				setLoadError(null);
 
 				await using processes = new Processes({ abort });
 
@@ -923,15 +913,14 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 					return;
 				}
 				if (error instanceof Error) {
-					let current = error;
-					while (current.cause instanceof Error) {
-						current = current.cause;
-					}
-					Toast.error(current.message);
+					setLoadError(error);
 				}
 			}
 			finally {
 				localAbort.abort();
+				if (abort.aborted) {
+					return;
+				}
 				setLoading(false);
 			}
 		});
@@ -939,7 +928,7 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 		return () => {
 			abort.abort();
 		};
-	}, [keyPair, serverKey, localStreamsWritePin, localStreamsUnrace, setServices, setLoading, processesGlobal]);
+	}, [keyPair, serverKey, localStreamsWritePin, localStreamsUnrace, setServices, setLoading, setLoadError, processesGlobal]);
 
 	return (
 		<View style={styles.container}>
@@ -964,9 +953,10 @@ const ServiceList: FC<ServiceListProps> = ({ keyPair, serverKey, localStreamsWri
 					) : undefined}
 					ItemSeparatorComponent={ServiceListSeparatorComponent}
 				/>
-			) || (!loading && (
+			) || (!loading && !loadError && (
 				<Text>No services found</Text>
 			))}
+			{loadError && errorFragment(loadError)}
 		</View>
 	);
 };
@@ -1074,16 +1064,15 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					});
 				}
 			}
-			catch(error) {
+			catch (error) {
 				if (abort.aborted) {
 					return;
 				}
 				if (error instanceof Error) {
-					let current = error;
-					while (current.cause instanceof Error) {
-						current = current.cause;
-					}
-					Toast.error(current.message);
+					setProxyStatus({
+						status: 'error',
+						error,
+					});
 				}
 			}
 		});
@@ -1104,6 +1093,10 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 				let port: number;
 				try {
 					await using processes = new Processes();
+
+					setProxyStatus({
+						status: 'loading',
+					});
 
 					const { writePin: streamWritePin, readPin } = createPipe<Uint8Array>();
 					const { writePin, readPin: streamReadPin } = createPipe<Uint8Array>();
@@ -1154,13 +1147,12 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					});
 				}
 			}
-			catch(error) {
+			catch (error) {
 				if (error instanceof Error) {
-					let current = error;
-					while (current.cause instanceof Error) {
-						current = current.cause;
-					}
-					Toast.error(current.message);
+					setProxyStatus({
+						status: 'error',
+						error,
+					});
 				}
 			}
 		});
@@ -1215,13 +1207,12 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 					localAbort.abort();
 				}
 			}
-			catch(error) {
+			catch (error) {
 				if (error instanceof Error) {
-					let current = error;
-					while (current.cause instanceof Error) {
-						current = current.cause;
-					}
-					Toast.error(current.message);
+					setProxyStatus({
+						status: 'error',
+						error,
+					});
 				}
 			}
 		});
@@ -1244,16 +1235,33 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 	}, [proxyStatus]);
 
 	switch (proxyStatus.status) {
-		case 'loading': return (
-			<ActivityIndicator size="large" />
-		);
-		case 'error': return (
-			<View>
-				<Text>Error</Text>
-				<Text>{proxyStatus.error.message}</Text>
-				<Text>{proxyStatus.error.stack}</Text>
+		case 'loading': return (<>
+			<View style={styles.proxyLoadingContainer}>
+				<ActivityIndicator size="large" style={styles.proxyLoadingIndicator} />
+				<Text style={styles.proxyLoadingFiller}>Proxy</Text>
 			</View>
-		);
+			<Text style={styles.labelPort}>Port</Text>
+			<View style={styles.inputPortContainer}>
+				<Text style={styles.inputPortFiller}>00000</Text>
+				<TextInput value={portStr} editable={false} style={styles.inputPort} />
+			</View>
+		</>);
+		case 'error': return (<>
+			<TextButton
+				title="Proxy"
+				onPress={startProxy}
+				style={styles.centerButton}
+				stylePressed={styles.centerButtonPressed}
+				styleText={styles.buttonText}
+				stylePressedText={styles.buttonPressedText}
+			/>
+			<Text style={styles.labelPort}>Port</Text>
+			<View style={styles.inputPortContainer}>
+				<Text style={styles.inputPortFiller}>00000</Text>
+				<TextInput value={portStr} onChangeText={setPortInput} keyboardType="number-pad" maxLength={5} style={styles.inputPort} />
+			</View>
+			{errorFragment(proxyStatus.error)}
+		</>);
 		case 'available': return (<>
 			<TextButton
 				title="Proxy"
@@ -1503,6 +1511,24 @@ const Grid = forwardRef<ViewInstance, GridProps>(({ rowStyle, cellStyle, numColu
 });
 Grid.displayName = 'Grid';
 
+function errorFragment(error: Error): React.JSX.Element {
+	const flatten: Error[] = [error];
+	let current = error;
+	while (current.cause instanceof Error) {
+		current = current.cause;
+		flatten.push(current);
+	}
+	return (<>
+		{flatten.map((cur, index) => (
+			<View key={`error_${ index }`}>
+				{index === 0 && (<Text>Error</Text>) || (<Text>Caused by</Text>)}
+				<Text>{cur.message}</Text>
+				<Text>{cur.stack}</Text>
+			</View>
+		))}
+	</>)
+}
+
 const styles = StyleSheet.create({
 	container: {
 		flex: 1,
@@ -1605,6 +1631,21 @@ const styles = StyleSheet.create({
 	},
 	centerButtonPressed: {
 		backgroundColor: '#2196f3',
+	},
+	proxyLoadingContainer: {
+		marginBottom: 20,
+		borderWidth: 1,
+		borderColor: 'transparent',
+	},
+	proxyLoadingFiller: {
+		fontSize: 20,
+		margin: 20,
+		opacity: 0,
+	},
+	proxyLoadingIndicator: {
+		position: "absolute",
+		alignSelf: "center",
+		top: 20,
 	},
 	input: {
 		borderColor: '#b9b9b9',

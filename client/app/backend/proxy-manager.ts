@@ -181,6 +181,7 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 	const remoteReady = new Abort();
 
 	async function retry() {
+		let lastError: unknown;
 		try {
 			const remoteError = new Abort();
 			const remoteConnect = new Abort();
@@ -236,6 +237,7 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 			await processes.finish();
 		}
 		catch (error) {
+			lastError = error;
 			if (!processesProxy.abort.aborted) {
 				// Unexpected disconnection is logged here
 				console.log(error);
@@ -247,7 +249,7 @@ async function runProxy(finalPort: Eventual<number>, node: DHT, keyPair: {
 			}
 			if (!remoteReady.aborted) {
 				// Failed on first attempt, do not retry
-				throw new Error('Failed to connect to proxy');
+				throw new Error('Failed to connect to proxy', { cause: lastError });
 			}
 
 			// Connection failed or unexpectedly disconnected
