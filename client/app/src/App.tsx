@@ -1236,10 +1236,13 @@ const ServiceProxy: FC<ServiceProxyProps> = ({ keyPair, serverKey, serviceName, 
 
 	switch (proxyStatus.status) {
 		case 'loading': return (<>
-			<View style={styles.proxyLoadingContainer}>
+			<Pressable
+				onPress={stopProxy}
+				style={({ pressed }) => pressed ? [styles.centerButton, styles.centerButtonPressed] : [styles.centerButton]}
+			>
 				<ActivityIndicator size="large" style={styles.proxyLoadingIndicator} />
-				<Text style={styles.proxyLoadingFiller}>Proxy</Text>
-			</View>
+				<Text style={styles.proxyLoadingFiller}>Stop</Text>
+			</Pressable>
 			<Text style={styles.labelPort}>Port</Text>
 			<View style={styles.inputPortContainer}>
 				<Text style={styles.inputPortFiller}>00000</Text>
@@ -1631,11 +1634,6 @@ const styles = StyleSheet.create({
 	},
 	centerButtonPressed: {
 		backgroundColor: '#2196f3',
-	},
-	proxyLoadingContainer: {
-		marginBottom: 20,
-		borderWidth: 1,
-		borderColor: 'transparent',
 	},
 	proxyLoadingFiller: {
 		fontSize: 20,

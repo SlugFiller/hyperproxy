@@ -99,7 +99,7 @@ export class ProxyManager {
 
 				{
 					// Validate that getting a port succeeded
-					await using processesAbort = new Processes({ aborts: [processesProxy.abort, abort] });
+					await using processesAbort = new Processes({ aborts: [processesProxy.abort, proxy.abort, abort] });
 					await proxy.port.getValue({ abort: processesAbort.abort });
 				}
 
@@ -151,7 +151,7 @@ export class ProxyManager {
 		if (services.size < 1) {
 			this.#activeProxies.delete(server64)
 		}
-		proxy.abort.abort();
+		proxy.abort.abort(new Error('Proxy stopped'));
 	}
 
 	removeAllProxies(serverKey: Uint8Array): void {
@@ -161,7 +161,7 @@ export class ProxyManager {
 			return;
 		}
 		for (const { abort } of services.values()) {
-			abort.abort();
+			abort.abort(new Error('Proxy stopped'));
 		}
 		this.#activeProxies.delete(server64)
 	}
